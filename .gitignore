@@ -1,3 +1,8 @@
+# Private docs — for personal reference only, never push
+PRD.md
+DOCS.md
+CONTEXT.md
+
 # Environment — never commit real secrets
 .env
 .env.local
