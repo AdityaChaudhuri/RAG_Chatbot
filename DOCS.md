@@ -1,6 +1,6 @@
-# Mr.Summarizer — Complete Code Documentation
+# Mr.Summarizer — Code Documentation
 
-Every file, every block, every line explained. Read this once and you will understand the entire codebase from top to bottom.
+Every file explained so you know the codebase from top to bottom.
 
 ---
 
@@ -30,7 +30,7 @@ Every file, every block, every line explained. Read this once and you will under
    - [retrieval/compressor.py](#retrievalcompressorpy)
 5. [Generation Layer](#generation-layer)
    - [generation/prompts.py](#generationpromptspy)
-   - [generation/claude.py](#generationclaudepy)
+   - [generation/gemini.py](#generationgeminipy)
 6. [API Routes](#api-routes)
    - [api/routes/documents.py](#apiroutesdocumentspy)
    - [api/routes/chat.py](#apirouteschatpy)
@@ -39,13 +39,13 @@ Every file, every block, every line explained. Read this once and you will under
 
 # SQL Layer
 
-The SQL layer lives in `sql/` and is run once against your Supabase project (in order, 001 → 005). It defines the entire data model, search engine, and access control for the app.
+Lives in `sql/` and runs once against your Supabase project in order (001 → 005). Defines the entire data model, search engine, and access control.
 
 ---
 
 ## 001_schema.sql
 
-**Purpose:** Creates every database table, the custom text-search configuration, and all indexes. This is the foundation everything else builds on.
+Creates every table, the custom text-search configuration, and all indexes.
 
 ---
 
@@ -54,507 +54,289 @@ The SQL layer lives in `sql/` and is run once against your Supabase project (in 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
-Loads **pgvector** — a PostgreSQL extension that adds a `VECTOR(n)` column type and operators for computing distances between vectors. We use it to store 1024-dimensional embeddings and run approximate nearest-neighbour (ANN) searches. `IF NOT EXISTS` makes this safe to re-run without error.
+Loads **pgvector** — adds a `VECTOR(n)` column type and distance operators for approximate nearest-neighbour search. We store 768-dimensional embeddings and query them with cosine distance. `IF NOT EXISTS` makes every statement safe to re-run.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ```
-Loads the **trigram** extension. A trigram is every 3-character substring of a word (e.g. "hello" → "hel", "ell", "llo"). pg_trgm lets PostgreSQL measure string similarity and build GIN/GiST indexes for fuzzy text matching. We use it as a safety net for queries where the user misspells a technical term.
+**Trigram** extension. Breaks strings into 3-character substrings for fuzzy text matching. Used as a fallback when a user misspells a technical term.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS unaccent;
 ```
-Loads **unaccent** — a text-search dictionary that strips diacritic marks (accents) from characters before indexing. So "Résumé" and "Resume" match in full-text search. It is plugged into our custom FTS configuration below.
+Strips diacritic marks before indexing, so "Résumé" and "Resume" match in full-text search. Plugged into the custom FTS config below.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 ```
-Provides `gen_random_uuid()` as a fallback UUID generator. PostgreSQL 13+ includes this natively, but the extension guarantees it exists in all Supabase environments.
+Provides `gen_random_uuid()` as a fallback. PostgreSQL 13+ includes it natively but the extension guarantees it in all Supabase environments.
 
 ---
 
-### Custom Full-Text Search Configuration
+### Custom FTS Configuration
 
 ```sql
 DO $$
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_ts_config WHERE cfgname = 'summarizer_fts'
-    ) THEN
-```
-`DO $$...$$` is a PL/pgSQL anonymous block — it lets us write procedural logic (like an IF statement) outside of a function. We wrap the FTS config creation in `IF NOT EXISTS` because `CREATE TEXT SEARCH CONFIGURATION` has no native `IF NOT EXISTS` clause — running it twice would error.
-
-```sql
+    IF NOT EXISTS (SELECT 1 FROM pg_ts_config WHERE cfgname = 'summarizer_fts') THEN
         CREATE TEXT SEARCH CONFIGURATION summarizer_fts (COPY = english);
-```
-Creates a new named FTS configuration called `summarizer_fts` by copying the built-in `english` config as a starting point. An FTS configuration defines the chain of dictionaries used to process text — what gets stemmed, what gets ignored (stop words), etc.
-
-```sql
         ALTER TEXT SEARCH CONFIGURATION summarizer_fts
             ALTER MAPPING FOR hword, compound_hword, hword_part, word, asciiword
             WITH unaccent, english_stem;
+    END IF;
+END
+$$;
 ```
-Overrides how the listed token types (normal words, hyphenated words, compound words, ASCII words) are processed. The chain is: first apply `unaccent` (strip accents), then `english_stem` (reduce words to their root, e.g. "running" → "run"). This means "Résumé" and "resumed" both match a search for "resume".
+`DO $$...$$` is a PL/pgSQL anonymous block — lets us write procedural logic outside a function. The `IF NOT EXISTS` workaround is needed because `CREATE TEXT SEARCH CONFIGURATION` has no native guard clause.
+
+The config chains two dictionaries: `unaccent` (strip accents) then `english_stem` (reduce words to their root). So "Résumé" and "resumed" both match a search for "resume".
 
 ---
 
 ### documents table
 
 ```sql
-CREATE TABLE IF NOT EXISTS documents (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid()
 ```
-`IF NOT EXISTS` — safe to run in migrations or re-deployments without destroying data.
+UUIDs throughout instead of serial integers — globally unique, no information leakage about row count.
 
 ```sql
-    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE
 ```
-Every document gets a universally unique ID auto-generated by PostgreSQL. UUIDs are used throughout (instead of serial integers) because they are globally unique — no collisions if you ever merge databases, and no information leakage about total row count.
+Foreign key to Supabase's built-in auth table. `ON DELETE CASCADE` — delete a user and all their documents disappear automatically. No orphaned rows possible.
 
 ```sql
-    user_id       UUID        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+doc_type TEXT CHECK (doc_type IN ('legal','academic','financial','technical','general'))
 ```
-Foreign key to Supabase's built-in `auth.users` table. `NOT NULL` — every document must belong to a user. `ON DELETE CASCADE` — if a user account is deleted, all their documents are deleted automatically. No orphan rows possible.
+The classifier's output. The `CHECK` constraint is a database-level guard against classifier bugs — only valid categories can be stored.
 
 ```sql
-    filename      TEXT        NOT NULL,
+entity_tags JSONB NOT NULL DEFAULT '{}'
 ```
-The original filename shown in the UI. `TEXT` in PostgreSQL is unlimited length (unlike `VARCHAR(n)`).
+`JSONB` is PostgreSQL's binary JSON. Supports indexing and containment operators (`@>`). Stores NER output: `{"people": ["John"], "orgs": ["Anthropic"]}`. `DEFAULT '{}'` means no NULLs — new rows start with an empty object.
 
 ```sql
-    file_url      TEXT        NOT NULL,
+chunk_count INT NOT NULL DEFAULT 0
 ```
-The public URL from Supabase Storage. Used to let the frontend display a download link.
-
-```sql
-    doc_type      TEXT        CHECK (doc_type IN ('legal','academic','financial','technical','general')),
-```
-The ML classifier's output. The `CHECK` constraint enforces that only valid categories can be stored — a database-level guard against bugs in the classifier. `NULL` is allowed here because the document row is inserted before classification runs (they're async).
-
-```sql
-    entity_tags   JSONB       NOT NULL DEFAULT '{}',
-```
-`JSONB` is PostgreSQL's binary JSON format. It's stored in a decomposed binary form that supports indexing and operators like `@>` (contains). We store NER output here: `{"people": ["John"], "orgs": ["Anthropic"]}`. `DEFAULT '{}'` means new rows start with an empty object, not NULL.
-
-```sql
-    chunk_count   INT         NOT NULL DEFAULT 0,
-```
-Starts at 0. The `trg_document_chunk_stats` trigger (in 002_triggers.sql) increments this every time a chunk is inserted. This means the application never needs to run `SELECT COUNT(*) FROM chunks WHERE document_id = X` to show the chunk count — it's always pre-computed.
-
-```sql
-    avg_chunk_len FLOAT,
-```
-Average token length across all chunks. Also maintained by the trigger. `FLOAT` (double precision, 64-bit) is appropriate for an average. `NULL` until at least one chunk exists.
-
-```sql
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-```
-`TIMESTAMPTZ` = timestamp with time zone. Always stored in UTC internally; PostgreSQL converts to the session timezone on output. `DEFAULT now()` means the application never has to supply this — PostgreSQL sets it automatically on insert.
+Starts at 0. The `trg_document_chunk_stats` trigger increments it on every chunk insert — no need for the app to run `COUNT(*)` queries.
 
 ---
 
 ### documents indexes
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_documents_user_id
-    ON documents (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents (user_id, created_at DESC);
 ```
-A composite B-tree index. When the frontend requests `SELECT * FROM documents WHERE user_id = X ORDER BY created_at DESC`, this index covers the entire query — no table scan, no sort. `DESC` matches the query's sort order so PostgreSQL can traverse the index forward.
+Composite B-tree. Covers `SELECT * FROM documents WHERE user_id = X ORDER BY created_at DESC` entirely — no sort step needed because `DESC` matches the index direction.
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_documents_entity_tags
-    ON documents USING GIN (entity_tags jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS idx_documents_entity_tags ON documents USING GIN (entity_tags jsonb_path_ops);
 ```
-A **GIN** (Generalised Inverted Index) on the JSONB column. GIN works by indexing every key-value pair inside the JSON, so the query `entity_tags @> '{"orgs": ["OpenAI"]}'` (does this document mention OpenAI?) is answered by an index lookup, not a row-by-row scan. `jsonb_path_ops` is a GIN operator class optimised for `@>` containment queries — smaller index than the default `jsonb_ops`.
+GIN (Generalised Inverted Index) on the JSONB column. Indexes every key-value pair inside the JSON, so `entity_tags @> '{"orgs": ["OpenAI"]}'` is answered by an index lookup, not a row scan. `jsonb_path_ops` is a smaller operator class optimised specifically for `@>` containment queries.
 
 ---
 
 ### chunks table
 
 ```sql
-CREATE TABLE IF NOT EXISTS chunks (
-    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id   UUID        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE
 ```
-Chunks belong to documents. `ON DELETE CASCADE` means deleting a document deletes all its chunks. Critical — without this you'd need to manually delete chunks before documents.
+Deliberately denormalised — `user_id` is also on `documents`. Storing it here lets `hybrid_search` filter by user without joining to `documents`, keeping the hot retrieval path to a single table.
 
 ```sql
-    user_id       UUID        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+embedding VECTOR(768)
 ```
-Deliberately denormalised — `user_id` is also on the `documents` table. Storing it here allows the `hybrid_search` stored procedure to filter by user without joining to `documents`, keeping the hot retrieval path to a single table.
+A 768-dimensional float array matching the output of BGE-base-en-v1.5. `NULL` is allowed briefly but our pipeline always writes the embedding before finishing.
 
 ```sql
-    content       TEXT        NOT NULL,
+fts_vector TSVECTOR
 ```
-The raw text of the chunk. This is what gets searched, displayed in citations, and sent to Claude.
-
-```sql
-    embedding     VECTOR(1024),
-```
-A 1024-dimensional float array. This matches the output dimension of Voyage AI's `voyage-3` model. `NULL` is allowed briefly — the chunk row could theoretically be inserted before embedding, though our pipeline never does this.
-
-```sql
-    fts_vector    TSVECTOR,
-```
-A pre-processed, tokenised representation of `content` optimised for full-text search. PostgreSQL stores it in a compact format. The `trg_chunk_fts` trigger populates this automatically whenever `content` is inserted or updated — the application never writes to this column directly.
-
-```sql
-    metadata      JSONB       NOT NULL DEFAULT '{}',
-```
-Flexible per-chunk metadata. We store `{"page_nums": [1, 2], "chunk_index": 4}`. Page numbers let us show citations in the UI. `chunk_index` lets us sort chunks into document order.
-
-```sql
-    token_count   INT,
-```
-Number of tokens (using cl100k_base encoding from tiktoken). Used for analytics and to ensure chunks don't exceed the LLM context window.
+Pre-processed tokenised representation of `content`, built automatically by the `trg_chunk_fts` trigger. The app never writes this column directly.
 
 ---
 
 ### chunks indexes
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-    ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 ```
-The most important index. **IVFFlat** (Inverted File with Flat compression) is an Approximate Nearest Neighbour index for vectors. It works by:
-1. Clustering all vectors into `lists` = 100 Voronoi cells at build time.
-2. At query time, finding which cells the query vector is closest to, then searching only those cells.
-
-This makes search O(lists) not O(n). `vector_cosine_ops` tells pgvector to measure distance using **cosine distance** (`1 - cosine_similarity`), which is appropriate for normalised embedding vectors because it measures the angle between vectors, ignoring magnitude. The trade-off: ANN may miss a tiny fraction of the true nearest neighbours, but it's 100–1000× faster than exact search.
+**IVFFlat** (Inverted File with Flat compression) is an Approximate Nearest Neighbour index. It clusters all vectors into `lists = 100` Voronoi cells at build time. At query time it searches only the closest cells, not the entire table. `vector_cosine_ops` measures cosine distance — appropriate for normalised vectors because it captures angular similarity regardless of magnitude. `lists = 100` handles up to ~1M vectors well.
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_chunks_fts
-    ON chunks USING GIN (fts_vector);
+CREATE INDEX IF NOT EXISTS idx_chunks_fts ON chunks USING GIN (fts_vector);
 ```
-**GIN** index on the tsvector column. When you run `fts_vector @@ query`, PostgreSQL looks up every lexeme (stemmed word) in the GIN index to find matching rows instantly, rather than reading every row. This is what makes FTS fast on millions of rows.
+GIN on the tsvector column. When you run `fts_vector @@ query`, PostgreSQL uses the GIN index to find matching rows instantly instead of reading every row.
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_chunks_metadata
-    ON chunks USING GIN (metadata jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS idx_chunks_user_doc ON chunks (user_id, document_id);
 ```
-GIN on JSONB metadata — enables fast `metadata @> '{"page_nums": [3]}'` queries for page-specific retrieval.
-
-```sql
-CREATE INDEX IF NOT EXISTS idx_chunks_document_id
-    ON chunks (document_id);
-```
-Simple B-tree for the common `WHERE document_id = X` pattern (e.g. fetching all chunks of a document for summarisation).
-
-```sql
-CREATE INDEX IF NOT EXISTS idx_chunks_user_doc
-    ON chunks (user_id, document_id);
-```
-Composite index for the most common retrieval pattern: `WHERE user_id = X AND document_id = Y`. The order matters — `user_id` is the leading column because it has higher cardinality relative to the query pattern.
+Composite index for the most common retrieval pattern: `WHERE user_id = X AND document_id = Y`. `user_id` is the leading column because it filters the most rows.
 
 ---
 
 ### chat_sessions table
 
 ```sql
-    document_id UUID        REFERENCES documents(id) ON DELETE SET NULL,
+document_id UUID REFERENCES documents(id) ON DELETE SET NULL
 ```
-Note `ON DELETE SET NULL` — if a document is deleted, the session survives (you can still read the conversation history) but its document reference is cleared. Compare to chunks which use CASCADE.
-
-```sql
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-```
-Updated by the `trg_touch_session` trigger on every new message. Allows the frontend to sort sessions by "most recently active" without a complex subquery.
+`ON DELETE SET NULL` — if a document is deleted, sessions survive with their history intact but `document_id` is cleared. Compare to chunks which use `CASCADE` (chunks without a document are useless).
 
 ---
 
 ### chat_history — Partitioned Table
 
 ```sql
-CREATE TABLE IF NOT EXISTS chat_history (
-    ...
-) PARTITION BY RANGE (created_at);
+CREATE TABLE IF NOT EXISTS chat_history (...) PARTITION BY RANGE (created_at);
 ```
-**Table partitioning** splits one logical table into multiple physical storage segments (partitions) based on a column's value range. Benefits:
-- **Performance**: queries filtered by `created_at` only scan relevant month partitions, not the whole table.
-- **Maintenance**: you can `DROP TABLE chat_history_2026_01` to archive old data instantly (no DELETE scan).
-- **Vacuuming**: each partition is vacuumed independently, reducing lock contention.
+Partitioning splits one logical table into physical segments by month. Benefits:
+- Queries filtered by date only scan the relevant partition, not the whole table.
+- Old months can be dropped instantly with `DROP TABLE chat_history_2026_01`.
+- Each partition is vacuumed independently — less lock contention.
 
 ```sql
-CREATE TABLE IF NOT EXISTS chat_history_2026_01
-    PARTITION OF chat_history FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE IF NOT EXISTS chat_history_2026_01 PARTITION OF chat_history FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
 ```
-`FOR VALUES FROM ... TO ...` defines the range. The upper bound is exclusive (standard half-open interval). A row with `created_at = '2026-01-31 23:59:59'` goes into this partition; `'2026-02-01 00:00:00'` goes into the next.
-
-```sql
-CREATE INDEX IF NOT EXISTS idx_chat_history_session
-    ON chat_history (session_id, created_at);
-```
-Indexes on the parent table automatically propagate to all child partitions in PostgreSQL 11+. No need to create them per-partition.
+The upper bound is exclusive (standard half-open interval). Indexes created on the parent table propagate automatically to all partitions in PG 11+.
 
 ---
 
 ## 002_triggers.sql
 
-**Purpose:** Defines trigger functions and attaches them to tables. Triggers let the database maintain derived state automatically — the application writes one row and the database keeps everything else consistent.
+Trigger functions that maintain derived state automatically so the application layer doesn't have to.
 
 ---
 
-### Trigger 1: update_chunk_fts
+### Trigger 1 — update_chunk_fts
 
 ```sql
-CREATE OR REPLACE FUNCTION update_chunk_fts()
-RETURNS TRIGGER
-LANGUAGE plpgsql AS $$
 BEGIN
     NEW.fts_vector := to_tsvector('summarizer_fts', NEW.content);
     RETURN NEW;
 END;
-$$;
 ```
-`CREATE OR REPLACE` — re-running this file updates the function without needing to drop it first.
+`NEW` is the row being inserted or updated. We assign the computed tsvector back to `fts_vector` before the write hits disk. `RETURN NEW` is required for `BEFORE` triggers — returning the (possibly modified) row tells PostgreSQL to proceed.
 
-`RETURNS TRIGGER` — this is a trigger function, not a normal callable function.
-
-`LANGUAGE plpgsql` — PL/pgSQL is PostgreSQL's procedural language, similar to PL/SQL in Oracle.
-
-`NEW` — the special record representing the row being inserted or updated. We can read and modify its columns before the write is committed.
-
-`to_tsvector('summarizer_fts', NEW.content)` — tokenises `content` using our custom FTS config (unaccent → english_stem) and returns a `tsvector`. For example, "Running quickly" becomes `'quick':2 'run':1`.
-
-`NEW.fts_vector := ...` — assigns the computed tsvector back to the `fts_vector` column of the row being written. Because this trigger fires `BEFORE INSERT OR UPDATE`, this modification happens before the row hits disk.
-
-`RETURN NEW` — required for `BEFORE` row-level triggers. Returning `NEW` means "proceed with this (possibly modified) row". Returning `NULL` would cancel the operation.
-
-```sql
-CREATE TRIGGER trg_chunk_fts
-    BEFORE INSERT OR UPDATE OF content
-    ON chunks
-    FOR EACH ROW
-    EXECUTE FUNCTION update_chunk_fts();
-```
-`BEFORE INSERT OR UPDATE OF content` — fires before any INSERT, and before any UPDATE that changes the `content` column (not every UPDATE — only when content changes). This is more efficient than `BEFORE INSERT OR UPDATE`.
-
-`FOR EACH ROW` — the trigger fires once per affected row (as opposed to `FOR EACH STATEMENT` which fires once per SQL statement regardless of row count).
+`BEFORE INSERT OR UPDATE OF content` — fires before any INSERT, and before any UPDATE that touches the `content` column specifically. Not every UPDATE, which keeps it efficient.
 
 ---
 
-### Trigger 2: update_document_chunk_stats
+### Trigger 2 — update_document_chunk_stats
 
 ```sql
-CREATE OR REPLACE FUNCTION update_document_chunk_stats()
-RETURNS TRIGGER
-LANGUAGE plpgsql AS $$
-BEGIN
-    UPDATE documents
-    SET
-        chunk_count   = chunk_count + 1,
-        avg_chunk_len = (
-            SELECT AVG(token_count)
-            FROM   chunks
-            WHERE  document_id = NEW.document_id
-        )
-    WHERE id = NEW.document_id;
-    RETURN NEW;
-END;
-$$;
+UPDATE documents
+SET
+    chunk_count   = chunk_count + 1,
+    avg_chunk_len = (SELECT AVG(token_count) FROM chunks WHERE document_id = NEW.document_id)
+WHERE id = NEW.document_id;
 ```
-`chunk_count + 1` — increments the pre-computed count. Incrementing is O(1) vs a COUNT(*) which is O(n).
-
-The `avg_chunk_len` subquery (`SELECT AVG(token_count) FROM chunks WHERE document_id = ...`) runs after the new chunk is already in the table (this is an AFTER trigger), so `AVG` includes the new row. This is a recalculation, not an incremental update — simpler and correct, though slightly slower at high chunk counts.
-
-```sql
-CREATE TRIGGER trg_document_chunk_stats
-    AFTER INSERT
-    ON chunks
-    FOR EACH ROW
-    EXECUTE FUNCTION update_document_chunk_stats();
-```
-`AFTER INSERT` — fires after the row is written. We use AFTER here (unlike the FTS trigger which uses BEFORE) because:
-- We don't need to modify the inserted row
-- We need the new chunk row to already exist in the table so the AVG subquery includes it
+`chunk_count + 1` is O(1). The `AVG` subquery is a recalculation — it runs after the new chunk exists in the table (this is an `AFTER` trigger), so it includes the new row. Simpler than an incremental formula and accurate.
 
 ---
 
-### Trigger 3: touch_session_on_message
+### Trigger 3 — touch_session_on_message
+
+Every new message bumps the session's `updated_at` so the session list stays ordered by most-recently-active without a separate UPDATE from the application.
+
+---
+
+### Trigger 4 — auto_title_session
 
 ```sql
-CREATE OR REPLACE FUNCTION touch_session_on_message()
-RETURNS TRIGGER
-LANGUAGE plpgsql AS $$
-BEGIN
+IF NEW.role = 'user' THEN
     UPDATE chat_sessions
-    SET    updated_at = now()
-    WHERE  id = NEW.session_id;
-    RETURN NEW;
-END;
-$$;
+    SET    title = LEFT(NEW.content, 60)
+    WHERE  id    = NEW.session_id
+      AND  title IS NULL;
+END IF;
 ```
-Every time any message (user or assistant) is inserted into `chat_history`, this trigger updates the session's `updated_at` timestamp. The frontend sorts sessions by `updated_at DESC` to show the most-recently-active conversation at the top — this keeps that order correct without the application needing to issue a separate UPDATE.
-
----
-
-### Trigger 4: auto_title_session
-
-```sql
-CREATE OR REPLACE FUNCTION auto_title_session()
-RETURNS TRIGGER
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF NEW.role = 'user' THEN
-        UPDATE chat_sessions
-        SET    title = LEFT(NEW.content, 60)
-        WHERE  id    = NEW.session_id
-          AND  title IS NULL;
-    END IF;
-    RETURN NEW;
-END;
-$$;
-```
-`IF NEW.role = 'user'` — only run this logic for user messages, not assistant responses.
-
-`LEFT(NEW.content, 60)` — take the first 60 characters of the user's message as the session title. This auto-generates a human-readable name ("What are the main findings of...") for the sidebar without requiring a separate API call.
-
-`WHERE ... AND title IS NULL` — only set the title once. If the session already has a title (from the first message), subsequent messages don't overwrite it. The `AND title IS NULL` condition makes the UPDATE a no-op on all messages after the first.
+Only fires for user messages (not assistant responses). `AND title IS NULL` means the title is set exactly once — from the first user message. No subsequent messages can overwrite it.
 
 ---
 
 ## 003_procedures.sql
 
-**Purpose:** Defines the core retrieval logic as a stored procedure inside PostgreSQL. Keeping retrieval logic in SQL (rather than Python) means the database planner can optimise it, and the entire retrieval pipeline runs in one network round-trip instead of three (vector search → Python → FTS search → Python → merge → Python → return).
-
 ---
 
 ### hybrid_search
 
-This is the most important function in the entire codebase. Read it carefully.
+The most important function in the codebase. Runs two independent retrieval strategies and merges their ranked results with Reciprocal Rank Fusion (RRF).
 
 ```sql
 CREATE OR REPLACE FUNCTION hybrid_search(
-    query_embedding  VECTOR(1024),
+    query_embedding  VECTOR(768),
     query_text       TEXT,
     target_user_id   UUID,
-    target_doc_id    UUID    DEFAULT NULL,
-    top_k            INT     DEFAULT 20,
-    rrf_k            INT     DEFAULT 60
+    target_doc_id    UUID  DEFAULT NULL,
+    top_k            INT   DEFAULT 20,
+    rrf_k            INT   DEFAULT 60
 )
 ```
-Parameters:
-- `query_embedding` — the 1024-d Voyage AI embedding of the user's question. This is what pgvector compares against stored chunk embeddings.
-- `query_text` — the raw text query for full-text search. Both are needed because vector and keyword search operate on different representations.
-- `target_user_id` — enforces that we only search this user's chunks. A second layer of isolation on top of RLS.
-- `target_doc_id DEFAULT NULL` — if provided, restricts search to one document. If NULL, searches all the user's documents.
-- `top_k DEFAULT 20` — how many final chunks to return. 20 is the pool size before re-ranking in Python.
-- `rrf_k DEFAULT 60` — the RRF damping constant. 60 is from the original RRF paper (Cormack et al., 2009). Higher values flatten score differences; lower values amplify the top ranks.
+- `query_embedding` — 768-d BGE-base-en-v1.5 embedding of the user's question.
+- `query_text` — raw text for the full-text search path. Both are needed because vector and keyword search operate on different representations of the query.
+- `target_doc_id DEFAULT NULL` — if provided, restricts to one document; NULL searches all the user's documents.
+- `rrf_k DEFAULT 60` — damping constant from the original RRF paper. Higher values flatten score differences; lower values amplify the top ranks.
 
 ```sql
-RETURNS TABLE (
-    chunk_id      UUID,
-    content       TEXT,
-    metadata      JSONB,
-    document_id   UUID,
-    vector_rank   BIGINT,
-    fts_rank      BIGINT,
-    rrf_score     FLOAT
-)
+LANGUAGE SQL STABLE SECURITY DEFINER
 ```
-Returns a result set (like a virtual table) rather than a single scalar. Each row is one chunk with its ranks and final RRF score — the Python re-ranker can use `vector_rank` and `fts_rank` for debugging/logging.
+`LANGUAGE SQL` — the function body is plain SQL CTEs. SQL functions can be inlined by the query planner, making them faster than PL/pgSQL equivalents.
 
-```sql
-LANGUAGE SQL
-STABLE
-SECURITY DEFINER
-```
-`LANGUAGE SQL` — the function body is plain SQL (CTEs), not PL/pgSQL. SQL functions can be inlined by the planner, making them faster than PL/pgSQL equivalents.
+`STABLE` — reads but does not modify the database. Lets the planner cache results within a transaction.
 
-`STABLE` — this function reads but does not modify the database, and returns the same result for the same inputs within a single transaction. `STABLE` allows PostgreSQL to cache the result and optimise accordingly.
-
-`SECURITY DEFINER` — the function runs with the permissions of its **owner** (the superuser who created it), not the caller. This is needed because `hybrid_search` bypasses RLS on `chunks` — but we still enforce isolation by filtering `user_id = target_user_id` inside the function body. SECURITY DEFINER is deliberate; the exposed parameter `target_user_id` must always be the authenticated user's ID (enforced in the Python layer).
+`SECURITY DEFINER` — runs as the table owner (bypasses RLS on chunks). User isolation is enforced by the `target_user_id` filter inside the body — equivalent isolation without exposing RLS to the planner.
 
 ---
 
-#### CTE 1: vector_hits (Dense Retrieval)
+#### CTE 1: vector_hits
 
 ```sql
-vector_hits AS (
-    SELECT
-        id,
-        content,
-        metadata,
-        document_id,
-        ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS v_rank
-    FROM chunks
-    WHERE user_id = target_user_id
-      AND (target_doc_id IS NULL OR document_id = target_doc_id)
-      AND embedding IS NOT NULL
-    ORDER BY embedding <=> query_embedding
-    LIMIT top_k * 2
-),
+ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS v_rank
+...
+LIMIT top_k * 2
 ```
-`embedding <=> query_embedding` — the `<=>` operator is pgvector's cosine distance operator. It returns a value between 0 (identical) and 2 (opposite). `ORDER BY` this value ascending = most similar chunks first.
+`<=>` is pgvector's cosine distance operator. `ROW_NUMBER()` assigns a rank to each result. Fetching `top_k * 2` gives the RRF merge more candidates — a chunk that ranks low in vector search but high in FTS would be missed if we only fetched `top_k`.
 
-`ROW_NUMBER() OVER (ORDER BY ...)` — assigns a sequential rank (1, 2, 3...) to each chunk by its vector distance. This rank feeds into the RRF formula.
-
-`LIMIT top_k * 2` — fetching 2× the final desired count gives the RRF merge more candidates to work with. If we only fetched `top_k`, chunks that appear low in the vector list but high in the FTS list would be missed.
-
-`AND embedding IS NOT NULL` — safety guard. A chunk without an embedding can't be ranked by vector distance and would cause an error.
+`AND embedding IS NOT NULL` — safety guard. A chunk without an embedding can't be ranked and would cause an error.
 
 ---
 
-#### CTE 2: fts_hits (Sparse Retrieval)
+#### CTE 2: fts_hits
 
 ```sql
-fts_hits AS (
-    SELECT
-        id,
-        content,
-        metadata,
-        document_id,
-        ROW_NUMBER() OVER (
-            ORDER BY ts_rank_cd(fts_vector, query, 32) DESC
-        ) AS f_rank
-    FROM
-        chunks,
-        websearch_to_tsquery('summarizer_fts', query_text) AS query
-    WHERE user_id = target_user_id
-      AND (target_doc_id IS NULL OR document_id = target_doc_id)
-      AND fts_vector @@ query
-    ORDER BY ts_rank_cd(fts_vector, query, 32) DESC
-    LIMIT top_k * 2
-),
+FROM chunks, websearch_to_tsquery('summarizer_fts', query_text) AS query
+WHERE fts_vector @@ query
+ORDER BY ts_rank_cd(fts_vector, query, 32) DESC
 ```
-`websearch_to_tsquery('summarizer_fts', query_text)` — converts a plain-language query into a `tsquery` object. `websearch_to_tsquery` handles phrases ("machine learning"), AND logic (multiple words = all must match), and gracefully ignores unsupported syntax. It's preferred over `to_tsquery` because raw user input often breaks `to_tsquery`'s strict syntax.
+`websearch_to_tsquery` handles natural language input gracefully — phrases, AND logic, and it never throws on unusual characters the way `to_tsquery` does.
 
-`FROM chunks, websearch_to_tsquery(...) AS query` — the comma here is a cross join, but since the right side is a single-row function result, it just aliases the query object as `query` for use throughout the SELECT and WHERE clauses.
+`@@` is the full-text match operator, accelerated by the GIN index on `fts_vector`.
 
-`fts_vector @@ query` — the `@@` operator checks if a `tsvector` matches a `tsquery`. This is what the GIN index on `fts_vector` accelerates — it's the core FTS operation.
+`ts_rank_cd` (cover density ranking) weights term matches that appear close together in the text more highly than scattered matches. The `32` argument normalises by document length so longer documents don't automatically outrank shorter ones.
 
-`ts_rank_cd(fts_vector, query, 32)` — ranks results by relevance. `cd` stands for "cover density" — it weights matches that are close together in the text more highly than scattered matches. The third argument `32` normalises the rank by document length (divides by the number of unique words). This prevents very long documents from always scoring higher than short ones just because they have more words.
+The cross join `FROM chunks, websearch_to_tsquery(...) AS query` is just a way to alias the query object so it's reusable across the SELECT and WHERE clauses.
 
 ---
 
 #### CTE 3: rrf (Reciprocal Rank Fusion)
 
 ```sql
-rrf AS (
-    SELECT
-        COALESCE(v.id,          f.id)          AS chunk_id,
-        COALESCE(v.content,     f.content)     AS content,
-        COALESCE(v.metadata,    f.metadata)    AS metadata,
-        COALESCE(v.document_id, f.document_id) AS document_id,
-        COALESCE(v.v_rank, (top_k * 2 + 1)::BIGINT) AS vector_rank,
-        COALESCE(f.f_rank, (top_k * 2 + 1)::BIGINT) AS fts_rank,
-        COALESCE(1.0 / (rrf_k + v.v_rank), 0.0) +
-        COALESCE(1.0 / (rrf_k + f.f_rank), 0.0) AS rrf_score
-    FROM vector_hits v
-    FULL OUTER JOIN fts_hits f ON v.id = f.id
-)
+FULL OUTER JOIN fts_hits f ON v.id = f.id
 ```
-`FULL OUTER JOIN` — includes rows that appear in **either** list, not just rows that appear in both. A chunk that ranks #1 in vector search but wasn't found by FTS still appears, and vice versa.
+`FULL OUTER JOIN` includes rows from **either** list, not just rows in both. A chunk that ranks #1 in vector search but wasn't found by FTS still appears.
 
-`COALESCE(v.id, f.id)` — if the chunk came from `vector_hits`, `v.id` is set and `f.id` is NULL (and vice versa). `COALESCE` picks the first non-NULL value, so this always gives us the chunk ID regardless of which list it came from.
+```sql
+COALESCE(v.v_rank, (top_k * 2 + 1)::BIGINT) AS vector_rank,
+COALESCE(1.0 / (rrf_k + v.v_rank), 0.0) +
+COALESCE(1.0 / (rrf_k + f.f_rank), 0.0) AS rrf_score
+```
+If a chunk only appears in one list, its rank in the missing list is `top_k * 2 + 1` (one beyond the last fetched rank), giving it a small non-zero contribution: `1 / (60 + 41) ≈ 0.01`.
 
-`COALESCE(v.v_rank, (top_k * 2 + 1)::BIGINT)` — if a chunk only appears in the FTS list (not in vector_hits), `v.v_rank` is NULL. We substitute `top_k * 2 + 1` (one position beyond the last fetched rank) as its "rank" in the missing list. This gives it a small but non-zero RRF contribution: `1 / (60 + 41) = ~0.0099`.
+**The RRF formula: score = 1/(k + rank_A) + 1/(k + rank_B)**
+- Rank #1 in both lists: `1/61 + 1/61 = 0.033` — highest possible.
+- Rank #1 in vector only: `1/61 + 0 = 0.016`.
+- Rank #20 in both: `1/80 + 1/80 = 0.025` — still competitive.
 
-**The RRF formula:** `score = 1/(k + rank_A) + 1/(k + rank_B)`
-- A chunk ranked #1 in both lists: `1/(60+1) + 1/(60+1) = 0.0328` — highest possible score.
-- A chunk ranked #1 in vector, missing from FTS: `1/(60+1) + 0 = 0.0164`.
-- A chunk ranked #20 in both: `1/(60+20) + 1/(60+20) = 0.025` — still competes if it appears in both.
-
-The beauty of RRF: it doesn't require scores to be on the same scale (vector distances are 0–2, FTS scores are 0–1), it only uses ranks, which are always comparable.
+RRF works because it only uses ranks, not raw scores — so vector distances (0–2) and FTS scores (0–1) are always comparable.
 
 ---
 
@@ -562,178 +344,99 @@ The beauty of RRF: it doesn't require scores to be on the same scale (vector dis
 
 ```sql
 WITH ranked AS (
-    SELECT
-        role,
-        content,
-        created_at,
-        ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
-    FROM chat_history
-    WHERE session_id = p_session_id
+    SELECT role, content, created_at,
+           ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
+    FROM chat_history WHERE session_id = p_session_id
 )
-SELECT role, content, created_at
-FROM   ranked
-WHERE  rn <= p_limit
-ORDER  BY created_at ASC;
+SELECT role, content, created_at FROM ranked WHERE rn <= p_limit ORDER BY created_at ASC;
 ```
-`ROW_NUMBER() OVER (ORDER BY created_at DESC)` — numbers rows newest-first. So `rn = 1` is the most recent message.
-
-`WHERE rn <= p_limit` — keeps only the most recent `p_limit` messages.
-
-`ORDER BY created_at ASC` — re-sorts oldest-first for the final output, because the Claude API expects messages in chronological order (oldest first).
-
-The two-pass approach (DESC in the window, ASC in the outer query) is a common SQL pattern for "get the last N rows in original order" — you can't do it in one pass without a subquery.
+`ROW_NUMBER() ... DESC` numbers rows newest-first. `WHERE rn <= p_limit` keeps only the most recent N. `ORDER BY ... ASC` re-sorts oldest-first for the final output because the Gemini API expects messages in chronological order.
 
 ---
 
 ### document_retrieval_stats
 
 ```sql
-PERCENT_RANK() OVER (ORDER BY avg_score)       AS score_percentile,
-avg_latency_ms - AVG(avg_latency_ms) OVER ()   AS latency_vs_avg_ms
+PERCENT_RANK() OVER (ORDER BY avg_score)     AS score_percentile,
+avg_latency_ms - AVG(avg_latency_ms) OVER () AS latency_vs_avg_ms
 ```
-`PERCENT_RANK()` — returns the relative rank of a row as a fraction between 0 and 1. A score_percentile of 0.9 means this session's retrieval quality is better than 90% of all sessions for this document.
-
-`AVG(avg_latency_ms) OVER ()` — a window function with an empty `OVER ()` clause computes the average across **all rows** in the result set. Subtracting it from each row's latency gives how many milliseconds above or below average each session was. Positive = slower than average; negative = faster.
+`PERCENT_RANK()` returns a value 0–1 representing how this session's quality compares to all sessions for this document. `AVG(...) OVER ()` with an empty window clause aggregates across all rows — subtracting it shows how far above or below average each session's latency is.
 
 ---
 
 ## 004_views.sql
 
-**Purpose:** Pre-computes analytics so the dashboard never has to run expensive aggregations on the fly. Also provides regular (non-materialized) views for always-fresh analytics.
-
 ---
 
 ### document_stats (Materialized View)
 
-A materialized view stores its result set as an actual table on disk. Unlike a regular view (which re-runs its query every time), a materialized view is instant to read. The trade-off is you must explicitly `REFRESH` it to pick up new data.
+Stores its result set as a physical table — instant to read, refreshed explicitly. `REFRESH MATERIALIZED VIEW CONCURRENTLY` rebuilds in the background without blocking reads. A unique index on `document_id` is required for concurrent refresh.
 
 ```sql
-WITH daily_counts AS (
-    SELECT
-        cs.document_id,
-        DATE_TRUNC('day', ch.created_at)  AS day,
-        COUNT(ch.id)                       AS daily_messages,
-        AVG(ch.retrieval_score)            AS daily_avg_score,
-        AVG(ch.latency_ms)                 AS daily_avg_latency
-    FROM chat_sessions cs
-    JOIN chat_history  ch ON ch.session_id = cs.id
-    WHERE ch.role = 'assistant'
-    GROUP BY cs.document_id, DATE_TRUNC('day', ch.created_at)
-),
+SUM(daily_messages) OVER (
+    PARTITION BY document_id
+    ORDER BY day
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+) AS rolling_7d_messages
 ```
-`DATE_TRUNC('day', ch.created_at)` — truncates a timestamp to the start of the day (midnight). This groups all messages from the same calendar day together for the rolling window calculation.
-
-`WHERE ch.role = 'assistant'` — we only count assistant messages, because only those have `retrieval_score` and `latency_ms`. Counting user messages would double-count interactions.
+Sliding window: sums the current day and the 6 days before it, per document. `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` is exactly 7 rows.
 
 ```sql
-rolling AS (
-    SELECT
-        ...
-        SUM(daily_messages) OVER (
-            PARTITION BY document_id
-            ORDER BY day
-            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-        )                                               AS rolling_7d_messages,
-        daily_messages - LAG(daily_messages, 1, 0) OVER (
-            PARTITION BY document_id ORDER BY day
-        )                                               AS day_over_day_delta
-    FROM daily_counts
-),
+daily_messages - LAG(daily_messages, 1, 0) OVER (PARTITION BY document_id ORDER BY day) AS day_over_day_delta
 ```
-`SUM(...) OVER (PARTITION BY document_id ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)` — a sliding window aggregate. For each day row, it sums `daily_messages` for that day and the 6 days before it. `PARTITION BY document_id` means the window resets at each new document (we don't mix documents' counts). `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` is the frame specification: exactly 7 rows (6 before + current).
-
-`LAG(daily_messages, 1, 0)` — looks back 1 row in the window (the previous day's count). The third argument `0` is the default if there's no previous row (i.e., the first day). Subtracting it gives the day-over-day change in usage — positive means growth, negative means decline.
+`LAG(column, 1, 0)` returns the previous row's value, with `0` as default if there's no prior row. Subtracting it gives the day-over-day change in usage.
 
 ```sql
-    RANK() OVER (
-        PARTITION BY t.user_id
-        ORDER BY t.total_messages DESC
-    )                                                   AS usage_rank,
+RANK() OVER (PARTITION BY t.user_id ORDER BY t.total_messages DESC) AS usage_rank
 ```
-`RANK()` assigns rank 1 to the document with the most messages, rank 2 to the next, etc. `PARTITION BY t.user_id` means rankings are per-user — user A's document ranked #1 is independent from user B's. `RANK()` (vs `ROW_NUMBER()`) allows ties: if two documents have the same message count, they both get rank 1 and the next rank is 3.
-
-```sql
-    PERCENT_RANK() OVER (
-        ORDER BY t.avg_retrieval_score
-    )                                                   AS score_percentile,
-```
-No `PARTITION BY` here — this ranks across **all documents globally**. A score_percentile of 0.95 means this document's average retrieval quality is better than 95% of all documents in the system. Useful for identifying which document types or chunk sizes yield better retrieval.
+Ranks each document within its user's library by query count. `PARTITION BY user_id` means user A's rank-1 document is independent of user B's. `RANK()` allows ties — two documents with equal counts both get rank 1, next rank is 3.
 
 ```sql
 LEFT JOIN LATERAL (
     SELECT rolling_7d_messages, day_over_day_delta
-    FROM   rolling
-    WHERE  document_id = t.document_id
-    ORDER  BY day DESC
-    LIMIT  1
-) r ON true;
+    FROM rolling WHERE document_id = t.document_id
+    ORDER BY day DESC LIMIT 1
+) r ON true
 ```
-`LATERAL` is one of SQL's most powerful features. A `LATERAL` subquery can reference columns from the tables to its left (here, `t.document_id`). Without `LATERAL`, a subquery in the FROM clause cannot see outer table columns.
-
-`ORDER BY day DESC LIMIT 1` — gets only the most recent day's rolling stats for each document. This is equivalent to "get the latest row per group" — a classic SQL problem, and `LATERAL` solves it cleanly without a complex GROUP BY or self-join.
-
-`ON true` — since it's a LATERAL join and we always want to include the document row (even if the rolling subquery returns nothing, which is why we used LEFT JOIN), the join condition is trivially true.
+`LATERAL` lets the subquery reference `t.document_id` from the outer query — without it you can't use outer columns inside a FROM subquery. `ORDER BY day DESC LIMIT 1` picks only the most recent day's rolling stats per document.
 
 ---
 
+### user_activity_summary
+
 ```sql
-CREATE UNIQUE INDEX IF NOT EXISTS idx_document_stats_id
-    ON document_stats (document_id);
+NTILE(4) OVER (ORDER BY total_queries DESC) AS engagement_quartile
 ```
-A unique index is **required** for `REFRESH MATERIALIZED VIEW CONCURRENTLY`. Without `CONCURRENTLY`, the refresh locks the view (blocking all reads) for the duration. With `CONCURRENTLY`, it builds a new version in the background and swaps atomically — no downtime. The unique index lets PostgreSQL know how to match old and new rows during the swap.
+Divides users into 4 equal-sized buckets by query count. Quartile 1 = top 25% most active. Useful for segmentation without verbose CASE WHEN logic.
 
 ---
 
-### user_activity_summary (Regular View)
+### chunk_quality_report
 
-```sql
-NTILE(4) OVER (ORDER BY total_queries DESC)         AS engagement_quartile
-```
-`NTILE(4)` divides the user population into 4 equal-sized buckets (quartiles). Users in quartile 1 are the top 25% by query count; quartile 4 are the bottom 25%. Useful for understanding user engagement distribution without writing complex CASE WHEN logic.
+Joins each assistant message's `source_chunks` JSONB array back to the `chunks` table via a LATERAL unnest — tracks which chunks are actually retrieved and how they score over time. Chunks with high retrieval frequency but low average score are candidates for re-chunking.
 
 ---
 
 ## 005_rls.sql
 
-**Purpose:** Row-Level Security (RLS) is PostgreSQL's mechanism for implementing multi-tenancy — ensuring every user can only see and modify their own data, enforced at the database level regardless of what the application does.
-
----
+Row-Level Security ensures every user can only read and write their own rows. `auth.uid()` returns the UUID from the current user's JWT — set automatically by Supabase when a user logs in. Service-role calls from the backend bypass RLS automatically.
 
 ```sql
-ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+CREATE POLICY documents_select ON documents FOR SELECT USING (user_id = auth.uid());
 ```
-Turns RLS on for the table. With RLS enabled, a query that doesn't match any policy returns zero rows (not an error) — from the user's perspective, rows they don't own simply don't exist.
+`USING` filters visible rows. A user who queries without matching rows sees zero results, not an error.
 
 ```sql
-CREATE POLICY documents_select ON documents
-    FOR SELECT USING (user_id = auth.uid());
+CREATE POLICY documents_insert ON documents FOR INSERT WITH CHECK (user_id = auth.uid());
 ```
-`FOR SELECT` — this policy applies to SELECT queries only.
+`WITH CHECK` validates the row being written. A user cannot insert a document with someone else's `user_id` — the database rejects it.
 
-`USING (user_id = auth.uid())` — `auth.uid()` is a Supabase helper function that returns the UUID of the currently authenticated user (from their JWT token). The `USING` clause is a filter: only rows where `user_id` matches the current user are visible. All other rows are silently hidden.
-
-```sql
-CREATE POLICY documents_insert ON documents
-    FOR INSERT WITH CHECK (user_id = auth.uid());
-```
-`WITH CHECK` (used for INSERT and UPDATE) verifies that the row being inserted satisfies the condition. A user cannot insert a document with someone else's `user_id` — the database rejects it. `USING` (used for SELECT, UPDATE, DELETE) filters which existing rows are visible/affected. INSERT has no existing rows so it uses `WITH CHECK`.
+Chunks have no UPDATE policy — they are immutable after ingestion. Chat history has no DELETE policy — messages can only be removed by deleting the parent session, which cascades. Both are intentional.
 
 ```sql
-ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
--- No UPDATE policy
+GRANT EXECUTE ON FUNCTION hybrid_search(VECTOR(768), TEXT, UUID, UUID, INT, INT) TO authenticated;
 ```
-Chunks are immutable after ingestion. Once embedded and stored, they never change. By omitting an UPDATE policy, any UPDATE attempt on chunks is rejected by the database — even if issued by an authenticated user. This is a data integrity guarantee.
-
-```sql
--- Hard deletes happen only via cascade from session deletion.
-```
-For `chat_history`, we intentionally omit DELETE policies. The only way to delete messages is by deleting the parent session, which triggers `ON DELETE CASCADE`. This prevents a user from selectively deleting unfavourable messages (audit trail integrity).
-
-```sql
-GRANT EXECUTE ON FUNCTION hybrid_search(VECTOR, TEXT, UUID, UUID, INT, INT)
-    TO authenticated;
-```
-Even though `hybrid_search` is `SECURITY DEFINER` (runs as owner), the `authenticated` role must still be explicitly granted permission to call it. Without this grant, logged-in users would get a "permission denied" error when their query hits the stored procedure via Supabase's RPC endpoint.
+Even though `hybrid_search` is `SECURITY DEFINER`, the `authenticated` role still needs explicit permission to call it — otherwise logged-in users get "permission denied" from Supabase's RPC endpoint.
 
 ---
 
@@ -745,45 +448,27 @@ Even though `hybrid_search` is `SECURITY DEFINER` (runs as owner), the `authenti
 
 ```python
 from pydantic_settings import BaseSettings, SettingsConfigDict
-```
-`pydantic_settings` extends Pydantic to load configuration from environment variables and `.env` files. It validates types at startup — if `ANTHROPIC_API_KEY` is missing from the environment, the app crashes immediately with a clear error, rather than failing mysteriously at runtime when the key is first used.
 
-```python
 class Settings(BaseSettings):
-    anthropic_api_key: str
-    voyage_api_key: str
+    gemini_api_key: str
+    supabase_url: str
+    supabase_anon_key: str
+    supabase_service_role_key: str
+    database_url: str
     ...
 ```
-Each attribute corresponds to an environment variable of the same name (uppercased). `str` means Pydantic will validate that the value exists and is a string. For `float` and `int` attributes, Pydantic automatically parses and validates the type.
+`pydantic_settings` loads configuration from environment variables and `.env` files, and validates types at startup. If `GEMINI_API_KEY` is missing, the app fails immediately with a clear error instead of crashing at runtime when the key is first used.
+
+Each attribute maps to an environment variable of the same name (uppercased). `str` fields are required; fields with defaults (like `chunk_similarity_threshold: float = 0.5`) are optional and can be overridden via environment variables without a code change.
 
 ```python
-    chunk_similarity_threshold: float = 0.5
-    chunk_min_tokens: int = 100
-    chunk_max_tokens: int = 512
-    retrieval_top_k: int = 20
-    rerank_top_k: int = 5
-    multi_query_variants: int = 4
+model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 ```
-These have defaults — they're optional in the environment. Setting them via environment variables lets you tune the pipeline without code changes (e.g. `RETRIEVAL_TOP_K=30` before a Railway deployment).
-
-```python
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-```
-`env_file=".env"` — tells pydantic-settings to also load variables from a `.env` file if one exists (the `.env.example` in the repo shows the format). `extra="ignore"` means extra variables in the environment that don't correspond to Settings fields are silently ignored, preventing errors on shared CI environments.
-
-```python
-settings = Settings()  # type: ignore[call-arg]
-```
-A module-level singleton. Every module imports `from app.config import settings` and accesses settings as attributes. The `# type: ignore` suppresses a mypy false positive (mypy can't statically verify that all required env vars will be present at runtime).
+`extra="ignore"` silently drops unknown environment variables — no errors on shared CI environments that have unrelated keys.
 
 ---
 
 ## db/client.py
-
-```python
-from supabase import create_client, Client
-```
-The official Supabase Python client. Under the hood it wraps HTTP calls to Supabase's PostgREST API (for table operations) and Storage API. It also provides `.rpc()` for calling stored procedures.
 
 ```python
 _client: Client | None = None
@@ -791,72 +476,42 @@ _client: Client | None = None
 def get_supabase() -> Client:
     global _client
     if _client is None:
-        _client = create_client(
-            settings.supabase_url,
-            settings.supabase_service_role_key,
-        )
+        _client = create_client(settings.supabase_url, settings.supabase_service_role_key)
     return _client
-```
-**Lazy singleton pattern.** The client is only created when first needed (not at import time). `global _client` allows the function to modify the module-level variable. On subsequent calls, the existing client is returned — no new HTTP connections are opened.
 
-`supabase_service_role_key` — the service role key bypasses all RLS policies. This is intentional for the backend: our server code does its own user isolation (always passing `user_id` to queries) and needs to write rows that reference other users' data (e.g. the chunking pipeline writes chunks for a specific user). The service role key must **never** be sent to the frontend.
-
-```python
 supabase: Client = get_supabase()
 ```
-Module-level convenience alias. Most modules do `from app.db.client import supabase` and use it directly, rather than calling `get_supabase()` every time.
+Lazy singleton — the client is only created when first accessed, not at import time. `supabase_service_role_key` bypasses RLS; this is intentional for the backend which needs to write rows on behalf of users. This key must never reach the frontend.
+
+`supabase` at module level is a convenience alias — every other module does `from app.db.client import supabase`.
 
 ---
 
 ## main.py
 
 ```python
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-```
-FastAPI is an async Python web framework. It generates OpenAPI (Swagger) documentation automatically, validates request/response types using Pydantic, and has first-class support for async route handlers and streaming responses.
-
-```python
-app = FastAPI(
-    title="Mr.Summarizer API",
-    description="...",
-    version="1.0.0",
-)
-```
-`title` and `description` appear in the auto-generated `/docs` Swagger UI — helpful during development.
-
-```python
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://mr-summarizer.vercel.app",
-    ],
+    allow_origins=["http://localhost:3000", "https://mr-summarizer.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 ```
-**CORS (Cross-Origin Resource Sharing)** is a browser security mechanism. Without CORS headers, browsers block JavaScript from `localhost:3000` making requests to the backend at a different origin. This middleware injects the correct `Access-Control-Allow-*` headers. `allow_credentials=True` is needed because we send auth tokens in headers. `allow_methods=["*"]` allows GET, POST, DELETE, etc. The `allow_origins` list is explicit — `"*"` would be insecure in production.
+Without CORS headers, browsers block JavaScript on `localhost:3000` from calling the backend at a different origin. The origins list is explicit — using `"*"` would be insecure in production because it allows any site to make credentialed requests.
 
 ```python
-app.include_router(documents.router)
-app.include_router(chat.router)
-```
-`APIRouter` objects group related endpoints. Including them here registers all their routes on the main app. The router's `prefix` (e.g. `/documents`) is prepended to all route paths.
-
-```python
-@app.get("/health", tags=["meta"])
+@app.get("/health")
 def health():
     return {"status": "ok", "service": "mr-summarizer"}
 ```
-A health check endpoint. Railway and other platforms hit this route to verify the service is running before sending traffic. Returning a JSON object is standard; the key `status: ok` is the minimal signal needed.
+Railway and other platforms poll this endpoint before routing traffic to the instance. Returning `status: ok` is the minimal signal they need.
 
 ---
 
 # Ingestion Pipeline
 
-The ingestion pipeline runs once per document upload. It takes a raw PDF file and ends with embedded, indexed chunks in the database.
+Runs once per document upload. Takes a raw PDF and ends with embedded, indexed chunks in the database.
 
 ---
 
@@ -865,236 +520,152 @@ The ingestion pipeline runs once per document upload. It takes a raw PDF file an
 ```python
 import fitz  # PyMuPDF
 ```
-`fitz` is the Python binding for the MuPDF rendering library. Despite the confusing import name, it's installed as `pymupdf`. It is the fastest and most accurate PDF text extractor available in Python — handles complex layouts, multi-column text, and embedded fonts better than alternatives like `pdfplumber` or `pdfminer`.
+`fitz` is the Python binding for MuPDF. Despite the import name, it's installed as `pymupdf`. It handles complex PDF layouts, multi-column text, and embedded fonts better than alternatives like `pdfplumber`.
 
 ```python
-def parse_pdf(file_path: str | Path) -> list[dict]:
-    doc = fitz.open(str(file_path))
+for page_num, page in enumerate(doc, start=1):
+    text = page.get_text("text")
+    cleaned = text.strip()
+    if cleaned:
+        pages.append(...)
 ```
-`fitz.open()` loads the PDF into memory. We `str()` the path because MuPDF's C bindings expect a string, not a `pathlib.Path` object.
-
-```python
-    for page_num, page in enumerate(doc, start=1):
-        text = page.get_text("text")
-```
-`enumerate(doc, start=1)` — iterates over pages while tracking the 1-based page number. `start=1` matches human-readable page numbering.
-
-`page.get_text("text")` — extracts plain text. The `"text"` mode reads text in natural reading order (top-to-bottom, left-to-right). Alternative modes: `"blocks"` for layout analysis, `"dict"` for detailed character-level data. For our use case, `"text"` is sufficient and fastest.
-
-```python
-        cleaned = text.strip()
-        if cleaned:
-```
-`.strip()` removes leading/trailing whitespace. The `if cleaned:` guard skips pages that are entirely images (scanned documents), page-break markers, or blank pages — adding empty chunks would harm retrieval quality.
+`enumerate(doc, start=1)` gives 1-based page numbers matching what users see in a PDF viewer. `if cleaned:` skips pages that are entirely images (scanned docs), page-break markers, or blank pages — empty chunks harm retrieval quality.
 
 ```python
 def full_text(pages: list[dict]) -> str:
     return "\n\n".join(p["content"] for p in pages)
 ```
-Joins all pages with double newlines (paragraph breaks). Used by NER and the classifier which need the complete document text, not individual pages.
+Joins all pages with double newlines. Used by NER and the classifier, which need the whole document as one string.
 
 ---
 
 ## ingestion/chunker.py
 
-This is the most technically interesting ingestion file.
-
 ```python
 _ENCODER = tiktoken.get_encoding("cl100k_base")
 ```
-`tiktoken` is OpenAI's tokeniser library — but `cl100k_base` is the BPE (Byte Pair Encoding) vocabulary used by GPT-4, Claude, and Voyage AI. Using it for token counting gives us accurate estimates of how many tokens a chunk will consume in the LLM's context window. It's loaded at module level (once) because initialising a tokeniser is relatively expensive.
+`cl100k_base` is the BPE vocabulary used by GPT-4 and most modern LLMs. Using it for token counting gives accurate estimates of how many tokens a chunk will consume in the model's context window.
 
 ```python
-_EMBED_MODEL: SentenceTransformer | None = None
-
-def _get_embed_model() -> SentenceTransformer:
-    global _EMBED_MODEL
-    if _EMBED_MODEL is None:
-        _EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-    return _EMBED_MODEL
+_EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 ```
-**Lazy loading** — the SentenceTransformer model (which loads hundreds of MB of weights) is only initialised on first use. This avoids a slow startup if the chunker module is imported but never called (e.g. in test environments). `all-MiniLM-L6-v2` is chosen specifically for chunking (not retrieval) because it's extremely fast (6× faster than `all-mpnet-base-v2`) and accurate enough for detecting topic boundary shifts.
+A lightweight model used only for detecting topic boundaries, not for retrieval. It's 6× faster than the retrieval model and accurate enough for comparing adjacent sentences.
 
 ```python
-def _split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
-```
-`(?<=[.!?])` is a **positive lookbehind** — it matches the position after a `.`, `!`, or `?` but doesn't consume those characters. `\s+` matches one or more whitespace characters. Together they split on sentence-ending punctuation followed by whitespace, without removing the punctuation itself. The list comprehension strips each sentence and filters empty strings.
-
-```python
-def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+def _cosine(a, b):
     denom = np.linalg.norm(a) * np.linalg.norm(b)
     return float(np.dot(a, b) / denom) if denom > 1e-8 else 0.0
 ```
-Cosine similarity = dot product divided by the product of magnitudes. `1e-8` guards against division by zero for zero-vectors (e.g. a sentence that embeds to all zeros). Returns a value between -1 and 1; we use the threshold `0.5` to detect topic shifts (similarity < 0.5 = likely a different topic).
-
-Note: we use `SentenceTransformer(..., normalize_embeddings=True)` below, so all vectors are unit-length (magnitude = 1). For unit vectors, `dot(a, b) == cosine_similarity(a, b)` directly — but we keep the full formula for correctness with any input.
+`1e-8` guards against division by zero for zero-vectors. Since we use `normalize_embeddings=True` below, all vectors are unit-length — `dot(a, b)` equals cosine similarity directly. The full formula is kept for correctness with any input.
 
 ```python
-    embeddings: np.ndarray = model.encode(
-        texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True
-    )
+boundaries = {0}
+for i, sim in enumerate(similarities):
+    if sim < threshold:
+        boundaries.add(i + 1)
+boundaries.add(len(sentences))
 ```
-`model.encode()` runs all sentences through the transformer in batches of 64. `normalize_embeddings=True` L2-normalises each vector (divides by its magnitude) so all vectors are on the unit sphere. This is required for cosine similarity to work correctly. `show_progress_bar=False` suppresses output in production (it's useful during development).
+`boundaries` is a Python set — automatically unique and unordered. We seed it with `{0}` (the start) and `len(sentences)` (the end) unconditionally, then add interior split points where similarity drops. `sorted()` gives boundary positions in order for slicing.
 
-```python
-    boundaries = {0}
-    for i, sim in enumerate(similarities):
-        if sim < threshold:
-            boundaries.add(i + 1)
-    boundaries.add(len(sentences))
-    sorted_boundaries = sorted(boundaries)
-```
-`boundaries` is a Python set (unordered, unique). We seed it with `{0}` (the start) and add `len(sentences)` (the end) unconditionally. Between them, we add index `i+1` whenever the similarity between sentence `i` and sentence `i+1` drops below threshold — that position is a topic boundary. Sorting gives us the boundary positions in order, ready for slicing.
-
-```python
-    for i in range(len(sorted_boundaries) - 1):
-        start = sorted_boundaries[i]
-        end = sorted_boundaries[i + 1]
-        span = sentences[start:end]
-```
-Each pair of consecutive boundaries defines a chunk's sentence range. `sentences[start:end]` is a Python slice — it includes `start` but excludes `end`.
-
-```python
-    buffer: dict | None = None
-    for chunk in raw:
-        if buffer is None:
-            buffer = chunk
-        elif buffer["token_count"] < min_tok:
-            buffer["content"] += " " + chunk["content"]
-            ...
-        else:
-            merged.append(buffer)
-            buffer = chunk
-```
-The merge pass uses a **buffer** pattern: we accumulate chunks into the buffer until the buffer is large enough (`>= min_tok`) to stand alone, then flush it and start a new buffer. This prevents very short chunks (e.g. a section heading that became its own boundary) from being passed to the embedder and retriever independently.
+The merge pass uses a buffer pattern: accumulate chunks until the buffer reaches `min_tok` tokens, then flush and start a new buffer. This prevents very short chunks (like a section heading that became its own boundary) from being indexed alone.
 
 ---
 
 ## ingestion/ner.py
 
 ```python
-_NLP: spacy.language.Language | None = None
-```
-The spaCy transformer model (`en_core_web_trf`) is ~500 MB. Lazy loading avoids loading it on every request — it's loaded once and reused.
-
-```python
 _LABEL_MAP = {
     "PERSON": "people",
-    "ORG": "orgs",
-    "DATE": "dates",
+    "GPE": "locations",
+    "LOC": "locations",
     ...
 }
 ```
-Maps spaCy's internal label names to our cleaner JSONB key names. `GPE` (Geo-Political Entity) and `LOC` both map to `"locations"` — merging them avoids a confusing split between "San Francisco" (GPE) and "the Amazon rainforest" (LOC) in the output.
+Maps spaCy's internal label names to cleaner JSONB keys. `GPE` (Geo-Political Entity) and `LOC` both map to `"locations"` — merging them avoids a confusing split between "San Francisco" (GPE) and "the Amazon rainforest" (LOC).
 
 ```python
 _MAX_CHARS = 100_000
 doc = nlp(text[:_MAX_CHARS])
 ```
-spaCy's transformer model has a soft limit on input length (it processes text in windows). Beyond ~100k characters, memory usage grows steeply and accuracy degrades. Capping at 100k characters covers most PDFs (a 200-page academic paper is roughly 300k characters, so we capture the first third — where abstracts, introductions, and key findings are concentrated).
+spaCy's transformer model processes text in windows — beyond ~100k characters, memory usage grows steeply and accuracy degrades. 100k characters covers most of a typical PDF's most entity-rich sections (introduction, key sections).
 
 ```python
-    for ent in doc.ents:
-        key = _LABEL_MAP.get(ent.label_)
-        if key:
-            cleaned = ent.text.strip()
-            if len(cleaned) > 1:
-                entities[key].add(cleaned)
+entities[key].add(cleaned)
 ```
-`doc.ents` is spaCy's list of detected entities. `.get(ent.label_)` returns `None` for labels we don't care about (like `CARDINAL`, `PERCENT`, `QUANTITY`), so they're automatically skipped. `len(cleaned) > 1` filters single-character false positives (e.g. the letter "I" being tagged as a person).
-
-`entities[key].add(cleaned)` — `entities` is a `defaultdict(set)`, so we can `.add()` without checking if the key exists. Using a `set` automatically deduplicates — if "Anthropic" appears 50 times in a document, it appears once in the output.
-
-```python
-    return {k: sorted(v) for k, v in entities.items()}
-```
-Converting sets to sorted lists before returning ensures consistent JSON output (sets are unordered; JSON arrays have a defined order).
+`entities` is a `defaultdict(set)`. Using a set means "Anthropic" appearing 50 times in a document only appears once in the output. `sorted(v)` converts sets to lists before returning — JSON arrays have a defined order; sets don't.
 
 ---
 
 ## ingestion/classifier.py
 
 ```python
-_CLASSIFIER = hf_pipeline(
-    "zero-shot-classification",
-    model="facebook/bart-large-mnli",
-    device=-1,
-)
+_CLASSIFIER = hf_pipeline("zero-shot-classification", model="facebook/bart-large-mnli", device=-1)
 ```
-`facebook/bart-large-mnli` is a BART model fine-tuned on the Multi-NLI (natural language inference) dataset. Zero-shot classification works by reformulating classification as NLI: "Does this text entail that it is about [legal documents]?" The model scores each label as a probability of entailment.
+BART-large-MNLI frames classification as natural language inference: "Does this text entail it is about [legal documents]?" The model scores each label as a probability of entailment — no task-specific training data needed.
 
-`device=-1` forces CPU inference. For our use case (one classification per document upload, not per query), CPU is fast enough and avoids GPU memory allocation overhead.
+`device=-1` forces CPU. For one classification per upload (not per query), CPU is fast enough and avoids GPU memory overhead.
 
 ```python
-_SAMPLE_CHARS = 2_000
 result = _get_classifier()(sample, _LABELS, multi_label=False)
 return result["labels"][0]
 ```
-`multi_label=False` — exactly one label is chosen (the highest probability). `result["labels"]` is sorted by score descending, so `[0]` is the winner. We use only 2000 characters because the BART model has a 1024 token limit — beyond that, text is truncated anyway. Using the beginning of the document (abstract, introduction) is also the most informative section for classification.
+`multi_label=False` — one label wins. `result["labels"]` is sorted by probability descending, so `[0]` is the top result. Only the first 2000 characters are passed — the BART model has a 1024-token limit anyway, and the beginning of a document (abstract, intro) is the most informative for classification.
 
 ---
 
 ## ingestion/embedder.py
 
 ```python
-_MODEL = "voyage-3"
-_BATCH_SIZE = 128
+_MODEL_NAME = "BAAI/bge-base-en-v1.5"
+_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 ```
-`voyage-3` is Voyage AI's best general-purpose embedding model at the time of writing — 1024 dimensions, state-of-the-art on MTEB benchmarks. The batch size of 128 matches Voyage AI's API limit per request.
+BGE models are trained with an instruction prefix on the query side — omitting it at query time degrades retrieval accuracy by ~2–3%. Documents are embedded without any prefix. This asymmetry is intentional; always use `embed_documents` at ingestion time and `embed_query` at search time.
+
+`_BATCH_SIZE = 32` is conservative — safe on CPU with limited RAM. Increase on machines with more memory for faster ingestion.
 
 ```python
 def embed_documents(texts: list[str]) -> list[list[float]]:
-    for i in range(0, len(texts), _BATCH_SIZE):
-        batch = texts[i : i + _BATCH_SIZE]
-        result = client.embed(batch, model=_MODEL, input_type="document")
-        all_embeddings.extend(result.embeddings)
+    embeddings: np.ndarray = _get_model().encode(
+        texts, batch_size=_BATCH_SIZE, normalize_embeddings=True, show_progress_bar=False
+    )
+    return embeddings.tolist()
 ```
-`range(0, len(texts), _BATCH_SIZE)` generates start indices: 0, 128, 256... The slice `texts[i : i + _BATCH_SIZE]` gives each batch. This handles any number of texts without hitting the API's per-request limit.
-
-`input_type="document"` vs `input_type="query"` — Voyage AI trains its models with asymmetric embeddings. Document embeddings are optimised for being retrieved; query embeddings are optimised for doing the retrieving. Using the wrong type degrades retrieval quality. Always use `"document"` at ingestion time and `"query"` at search time.
+`normalize_embeddings=True` L2-normalises each vector to unit length. Required for cosine similarity to work correctly — un-normalised vectors would cause magnitude to skew results. `.tolist()` converts numpy arrays to plain Python lists for JSON serialisation.
 
 ---
 
 ## ingestion/pipeline.py
 
 ```python
-async def ingest_document(...) -> dict:
+async def ingest_document(file_path, user_id, filename, file_url) -> dict:
 ```
-`async def` — this is an asynchronous function, meaning it can be `await`ed and will yield control to the event loop while waiting for I/O (network calls, disk reads). FastAPI runs in an async event loop, so async ingestion doesn't block other requests.
+`async def` — yields control to the event loop during I/O, so FastAPI can serve other requests while a document is being ingested.
 
 ```python
-    entity_tags, doc_type = await asyncio.gather(
-        loop.run_in_executor(None, extract_entities, text),
-        loop.run_in_executor(None, classify_document, text),
-    )
+entity_tags, doc_type = await asyncio.gather(
+    loop.run_in_executor(None, extract_entities, text),
+    loop.run_in_executor(None, classify_document, text),
+)
 ```
-`asyncio.gather()` runs multiple coroutines **concurrently** and waits for all of them. Here, NER and classification both run simultaneously instead of sequentially — cutting ingestion time roughly in half for the analysis phase.
-
-`loop.run_in_executor(None, fn, arg)` — NER and classification are CPU-bound synchronous functions (they run a neural network). Running them directly in `async def` would block the event loop. `run_in_executor` moves them to a thread pool (the `None` argument uses the default ThreadPoolExecutor), allowing the event loop to remain responsive. The `await` then waits for both threads to complete.
+NER and classification are CPU-bound synchronous functions. `run_in_executor` moves each to a thread pool so they don't block the async event loop. `asyncio.gather` runs both concurrently — cuts the analysis phase roughly in half.
 
 ```python
-    doc_result = (
-        supabase.table("documents")
-        .insert({...})
-        .execute()
-    )
-    document_id: str = doc_result.data[0]["id"]
+doc_result = supabase.table("documents").insert({...}).execute()
+document_id: str = doc_result.data[0]["id"]
 ```
-Supabase's Python client uses a fluent/builder API. `.table("documents")` selects the table; `.insert({...})` specifies the data; `.execute()` fires the HTTP request to PostgREST. The response `.data` is a list of the inserted rows (with their `id` filled in by the database default). We extract `[0]["id"]` because we inserted exactly one row.
+The document row is inserted before chunks so foreign keys have a target. `.data[0]["id"]` retrieves the UUID the database generated for this row.
 
 ```python
-    for i in range(0, len(records), _CHUNK_INSERT_BATCH):
-        supabase.table("chunks").insert(records[i : i + _CHUNK_INSERT_BATCH]).execute()
+for i in range(0, len(records), _CHUNK_INSERT_BATCH):
+    supabase.table("chunks").insert(records[i : i + _CHUNK_INSERT_BATCH]).execute()
 ```
-Inserting chunks in batches of 100 prevents hitting Supabase's request body size limit (~1 MB). A document with 500 chunks at 1024 floats each would be ~2 MB in a single request — batching keeps each request well under the limit.
+Chunks are inserted in batches of 100 to stay within Supabase's ~1 MB request body limit. A document with 500 chunks would exceed the limit in a single request.
 
 ---
 
 # Retrieval Pipeline
 
-At query time, we run 4 stages: multi-query retrieval → hybrid SQL search → cross-encoder re-ranking → contextual compression. Each stage narrows and refines the candidate pool.
+Four stages at query time: multi-query retrieval → hybrid SQL search → cross-encoder re-ranking → contextual compression. Each stage narrows and refines the candidate pool.
 
 ---
 
@@ -1104,10 +675,9 @@ At query time, we run 4 stages: multi-query retrieval → hybrid SQL search → 
 def hybrid_search(query, user_id, document_id=None, top_k=None) -> list[dict]:
     query_vector = embed_query(query)
     result = supabase.rpc("hybrid_search", {...}).execute()
+    return result.data or []
 ```
-`embed_query(query)` — embeds the query using `input_type="query"` for the asymmetric matching described above.
-
-`supabase.rpc("hybrid_search", {...})` — calls the PostgreSQL stored procedure via Supabase's PostgREST RPC endpoint. The procedure name must exactly match the function name in SQL. Parameters are passed as a dict; Supabase serialises them into the correct PostgreSQL types. The `VECTOR(1024)` parameter is sent as a JSON array of 1024 floats.
+`embed_query` applies the BGE query prefix before embedding — the asymmetric prefix is what makes retrieval accurate. `supabase.rpc()` calls the PostgreSQL stored procedure via Supabase's PostgREST API. The `VECTOR(768)` parameter is serialised as a JSON array of 768 floats.
 
 ---
 
@@ -1115,38 +685,24 @@ def hybrid_search(query, user_id, document_id=None, top_k=None) -> list[dict]:
 
 ```python
 def _generate_variants(query: str, n: int) -> list[str]:
-    response = _get_client().messages.create(
-        model="claude-haiku-4-5-20251001",
-        ...
+    response = _get_model().generate_content(
+        f"Generate {n} semantically varied reformulations of this search query..."
     )
-```
-We use `claude-haiku-4-5-20251001` (the fastest, cheapest Claude model) for variant generation because:
-1. Speed matters — this runs synchronously before retrieval.
-2. The task is simple — rephrasing a question doesn't need Sonnet-level intelligence.
-3. Cost — this runs on every query; using Sonnet here would be expensive at scale.
-
-```python
-    lines = response.content[0].text.strip().splitlines()
+    lines = response.text.strip().splitlines()
     return [line.strip() for line in lines if line.strip()]
 ```
-`.splitlines()` splits on any newline character (`\n`, `\r\n`, etc.). The list comprehension strips whitespace from each line and filters empty lines — Claude sometimes adds blank lines between variants.
+Uses Gemini 2.0 Flash to generate `n` rephrased versions of the query. Different phrasings hit different vocabulary in the documents — a question about "termination notice" might also need to match chunks that say "contract cancellation policy".
 
 ```python
-def multi_query_retrieve(...) -> list[dict]:
-    best: dict[str, dict] = {}
-    for variant in all_queries:
-        chunks = hybrid_search(variant, user_id, document_id, top_k=k)
-        for chunk in chunks:
-            cid = chunk["chunk_id"]
-            if cid not in best or chunk["rrf_score"] > best[cid]["rrf_score"]:
-                best[cid] = chunk
+best: dict[str, dict] = {}
+for variant in all_queries:
+    chunks = hybrid_search(variant, user_id, document_id, top_k=k)
+    for chunk in chunks:
+        cid = chunk["chunk_id"]
+        if cid not in best or chunk["rrf_score"] > best[cid]["rrf_score"]:
+            best[cid] = chunk
 ```
-`best` is a dict keyed by `chunk_id`. For each chunk retrieved, we only keep it if it's the **highest-scoring appearance** across all query variants. A chunk that scores 0.04 for one variant and 0.06 for another is stored with score 0.06. This deduplication-with-best-score approach gives the reranker the most optimistic view of each chunk's relevance.
-
-```python
-    return sorted(best.values(), key=lambda c: c["rrf_score"], reverse=True)
-```
-After deduplication, sort by best RRF score descending. The re-ranker will then re-score and re-order these, so this sort is just for producing a sensible input order.
+`best` is keyed by `chunk_id`. Each chunk is only kept at its highest RRF score across all variants. This deduplication-with-best-score approach gives the reranker the most optimistic view of each chunk's relevance before it makes its final call.
 
 ---
 
@@ -1155,32 +711,21 @@ After deduplication, sort by best RRF score descending. The re-ranker will then 
 ```python
 _MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 ```
-MS MARCO is Microsoft's large-scale passage-ranking dataset (real Bing queries + human relevance labels). `MiniLM-L-6` is a distilled 6-layer model — much smaller and faster than the full cross-encoder, while retaining ~95% of its accuracy. "L-6" refers to 6 transformer layers.
+MS MARCO is Microsoft's large-scale passage-ranking dataset (real Bing queries + human relevance labels). `MiniLM-L-6` is a distilled 6-layer model — much smaller than the full cross-encoder while retaining ~95% of its accuracy.
 
-**Why a cross-encoder is better than a bi-encoder for re-ranking:**
-- **Bi-encoder** (Voyage AI): Encodes query and chunk independently → produces vectors → compare with dot product. Fast because embeddings are pre-computed. But the model never sees query+chunk together.
-- **Cross-encoder** (ms-marco): Takes query and chunk concatenated as a single input → outputs a single relevance score. Slower (one inference per pair) but much more accurate because the model can model interactions between query and chunk tokens.
-
-We apply cross-encoding only to the top-20 pool (not all chunks) to keep latency reasonable.
+**Why a cross-encoder is more accurate than a bi-encoder:**
+A bi-encoder (BGE) encodes the query and chunk independently — they never see each other. A cross-encoder concatenates query + chunk into a single input and produces one relevance score. The model can reason about the interaction between them, which is more accurate but slower (one forward pass per pair). We apply it only to the top-K pool, not all chunks.
 
 ```python
-    pairs = [(query, chunk["content"]) for chunk in chunks]
-    scores: list[float] = model.predict(pairs).tolist()
+pairs = [(query, chunk["content"]) for chunk in chunks]
+scores: list[float] = _get_model().predict(pairs).tolist()
 ```
-`model.predict(pairs)` — runs all pairs through the cross-encoder in one batched call (more efficient than calling it per-pair). Returns a numpy array of floats; `.tolist()` converts to a Python list.
+`model.predict(pairs)` batches all pairs in one call — more efficient than calling per-pair. `.tolist()` converts numpy to a Python list.
 
 ```python
-    scored = sorted(
-        zip(scores, chunks),
-        key=lambda x: x[0],
-        reverse=True,
-    )
-    return [
-        {**chunk, "rerank_score": score}
-        for score, chunk in scored[:k]
-    ]
+return [{**chunk, "rerank_score": score} for score, chunk in scored[:k]]
 ```
-`zip(scores, chunks)` pairs each score with its chunk. Sorting by score descending gives us the ranking. `{**chunk, "rerank_score": score}` uses dict unpacking to add `rerank_score` to each chunk dict without mutating the original — the `**` operator spreads all existing key-value pairs into the new dict.
+`{**chunk, "rerank_score": score}` spreads all existing chunk keys into a new dict and adds `rerank_score` — non-destructive, the original chunk is not mutated.
 
 ---
 
@@ -1189,28 +734,18 @@ We apply cross-encoding only to the top-20 pool (not all chunks) to keep latency
 ```python
 def compress_chunks(query: str, chunks: list[dict]) -> list[dict]:
     for chunk in chunks:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            ...
-            "content": (
-                f"Question: {query}\n\n"
-                f"Document excerpt:\n{chunk['content']}\n\n"
-                "Extract only the sentences from the excerpt that directly help "
-                "answer the question. Preserve exact wording. "
-                "If nothing is relevant, reply with an empty response."
-            ),
-```
-The prompt is carefully designed:
-- "Extract only" — prevents Claude from paraphrasing or adding outside knowledge.
-- "Preserve exact wording" — ensures citations remain verifiable against the source.
-- "If nothing is relevant, reply with an empty response" — allows us to drop chunks that the cross-encoder passed but that truly have no answer relevance.
-
-```python
-        text = response.content[0].text.strip()
+        response = _get_model().generate_content(
+            f"Question: {query}\n\n"
+            f"Document excerpt:\n{chunk['content']}\n\n"
+            "Extract only the sentences from the excerpt that directly help "
+            "answer the question. Preserve exact wording. "
+            "If nothing is relevant, reply with an empty response."
+        )
+        text = response.text.strip()
         if text:
             compressed.append({**chunk, "content": text})
 ```
-The empty-string check is the compression filter. Chunks that compress to nothing are excluded from the final context. This is the last line of defence against hallucination — if no chunk has relevant content, Claude receives no context, and the system prompt instructs it to say so rather than invent an answer.
+"Preserve exact wording" ensures citations remain verifiable. "If nothing is relevant, reply with an empty response" lets us drop chunks that the cross-encoder passed but that genuinely have no answer content — the `if text:` check is the filter. This is the last defence against hallucination: if no chunk compresses to anything useful, Gemini receives no context and the system prompt tells it to say so.
 
 ---
 
@@ -1222,79 +757,71 @@ The empty-string check is the compression filter. Chunks that compress to nothin
 
 ```python
 _DOC_TYPE_INSTRUCTIONS: dict[str, str] = {
-    "legal": (
-        "This is a legal document. Be precise about obligations, rights, and liabilities. "
-        "Use the exact terminology from the document. Flag any ambiguous clauses."
-    ),
+    "legal": "Be precise about obligations, rights, and liabilities. Use the exact terminology...",
+    "financial": "Be precise with figures, dates, and financial terminology. Do not round numbers.",
     ...
 }
 ```
-Different document types require different generation behaviours. For financial documents, Claude must not round numbers. For legal documents, it must use exact terminology (a paraphrase could change the legal meaning). These instructions are prepended to the user's query in the prompt, steering Claude's output style for the domain.
+Different document types need different generation behaviour. For financial documents Gemini must not round numbers. For legal documents a paraphrase could change the legal meaning. These instructions are prepended to the user's query.
 
 ```python
-def build_rag_prompt(query, chunks, doc_type="general") -> str:
-    context_blocks = "\n\n---\n\n".join(
-        "[Page {pages}]\n{content}".format(
-            pages=", ".join(str(p) for p in chunk.get("metadata", {}).get("page_nums", ["?"])),
-            content=chunk["content"],
-        )
-        for chunk in chunks
-    )
+context_blocks = "\n\n---\n\n".join(
+    "[Page {pages}]\n{content}".format(...)
+    for chunk in chunks
+)
 ```
-Each chunk is formatted with its page number(s) as a header (`[Page 3]`). The `---` separator between chunks makes the boundaries visually clear in the prompt. Page numbers enable Claude to write citations like "According to page 3..." — which the frontend can eventually highlight.
+Each chunk is formatted with its page number(s) as a header. The `---` separator makes chunk boundaries clear in the prompt. Page numbers enable Gemini to write citations like "According to page 3..." that the frontend can eventually highlight.
 
-```python
-    return (
-        f"{instruction}\n\n"
-        f"Document context:\n\n{context_blocks}\n\n"
-        f"Question: {query}\n\n"
-        "Answer based only on the document context above. "
-        "Reference specific pages where relevant."
-    )
-```
-The structure of this prompt follows the RAG best practice: instruction → context → question → constraint. Putting "Answer based only on the document context" at the end (nearest to where Claude begins its response) reinforces the grounding constraint.
+The prompt structure is: `instruction → context → question → grounding constraint`. Putting the constraint last ("Answer based only on the document context above") keeps it nearest to where Gemini starts generating.
 
 ---
 
-## generation/claude.py
+## generation/gemini.py
 
 ```python
-_CHAT_MODEL = "claude-sonnet-4-6"
-_FAST_MODEL = "claude-haiku-4-5-20251001"
-_HISTORY_WINDOW = 10
+import google.generativeai as genai
+
+CHAT_MODEL = "gemini-2.0-flash"
 ```
-`claude-sonnet-4-6` for the main answer — best balance of quality and speed for customer-facing generation.
-`claude-haiku-4-5-20251001` is used in multi_query.py and compressor.py for internal, non-user-visible calls.
-`_HISTORY_WINDOW = 10` — we send the 10 most recent turns as context. Sending more would increase token costs; sending fewer would break coherence in long conversations.
+Gemini 2.0 Flash is Google's fast general-purpose model — free tier, 1M token context window, suitable for production at scale.
 
 ```python
-def stream_answer(...) -> Generator[str, None, None]:
-    ...
-    with _get_client().messages.stream(
-        model=_CHAT_MODEL,
-        max_tokens=_MAX_TOKENS_CHAT,
-        system=system_prompt(),
-        messages=messages,
-    ) as stream:
-        for token in stream.text_stream:
-            yield token
+def _get_model() -> genai.GenerativeModel:
+    global _MODEL
+    if _MODEL is None:
+        genai.configure(api_key=settings.gemini_api_key)
+        _MODEL = genai.GenerativeModel(CHAT_MODEL, system_instruction=system_prompt())
+    return _MODEL
 ```
-`messages.stream()` opens a context manager that manages a streaming HTTP connection. `stream.text_stream` is a generator that yields each text token as it arrives from Anthropic's API — typically in chunks of 1–10 characters.
+Lazy singleton — model is initialised on first call. `system_instruction` is Gemini's dedicated slot for the system prompt, kept separate from the message history.
 
-`yield token` — makes `stream_answer` itself a generator. The caller (`chat.py`) iterates over the yielded tokens and sends them downstream via SSE. This means the first token reaches the user's browser within ~200ms, rather than waiting for the full response (~5–15 seconds for long answers).
+```python
+def _convert_history(history: list[dict]) -> list[dict]:
+    converted = []
+    for msg in history:
+        role = "model" if msg["role"] == "assistant" else msg["role"]
+        if role in ("user", "model"):
+            converted.append({"role": role, "parts": [{"text": msg["content"]}]})
+    return converted
+```
+Gemini uses "model" where the OpenAI format uses "assistant". This converts the history fetched from the database (OpenAI-style) to the format Gemini's API expects.
 
-The `system` parameter is the Anthropic API's system prompt slot — it's not part of the `messages` array and is handled specially by Claude (it cannot be overridden by the messages).
+```python
+def stream_answer(query, chunks, history, doc_type="general") -> Generator[str, None, None]:
+    chat = model.start_chat(history=gemini_history)
+    response = chat.send_message(prompt, stream=True, generation_config=...)
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text
+```
+`start_chat` creates a session with the conversation history. Streaming yields tokens as they arrive — the first token reaches the user's browser within ~200ms rather than waiting for the full response. The caller (`chat.py`) iterates over yielded tokens and sends them via SSE.
 
 ```python
 def summarise(chunks: list[dict], doc_type: str = "general") -> str:
-    prompt = build_summarise_prompt(chunks, doc_type)
-    response = _get_client().messages.create(...)
-    return response.content[0].text
+    response = model.generate_content(prompt, generation_config=...)
+    return response.text
 ```
-Summarisation is blocking (not streaming) because:
-1. It's triggered by a button, not a conversational turn — the user expects to wait.
-2. The full summary needs to be returned as a single JSON response, not a stream.
-`response.content[0]` — Claude's API returns content as a list of content blocks. For text responses, there's always exactly one block of type `"text"`, at index 0.
+Summarisation is blocking (not streaming) because it's triggered by a button click where the user expects to wait, and the full text needs to be returned as a single JSON response.
 
 ---
 
@@ -1310,138 +837,72 @@ def _require_user(x_user_id: str | None) -> str:
         raise HTTPException(401, "X-User-Id header required")
     return x_user_id
 ```
-A shared guard function used by every route. In production this would be replaced by proper JWT verification middleware — the `X-User-Id` header approach is a placeholder that's easy to swap. `HTTPException(401, ...)` causes FastAPI to return a 401 response with the message in the body.
+Every route calls this guard. In production this would be replaced by JWT middleware — `X-User-Id` is a placeholder that's easy to swap later.
 
 ```python
-@router.post("/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    x_user_id: str | None = Header(default=None),
-):
+with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+    tmp.write(content)
+    tmp_path = tmp.name
+try:
+    result = await ingest_document(tmp_path, ...)
+finally:
+    os.unlink(tmp_path)
 ```
-`UploadFile` — FastAPI's file upload type. It provides `file.filename`, `file.content_type`, and `await file.read()` for reading the binary content. `File(...)` marks it as required. `Header(default=None)` tells FastAPI to read the `X-User-Id` HTTP header.
+PyMuPDF requires a file path, not an in-memory buffer. The `try/finally` guarantees the temp file is deleted even if ingestion throws an exception — prevents disk leaks.
 
 ```python
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported")
+result = supabase.table("document_stats").select("*").eq("user_id", user_id).order("usage_rank").execute()
 ```
-Validates the file type by extension. In production you'd also check `file.content_type == "application/pdf"` and verify the PDF magic bytes (`%PDF`) — but extension checking catches most mistakes.
+The document list queries the materialized view `document_stats`, not the raw `documents` table. The frontend gets pre-computed `usage_rank`, `rolling_7d_messages`, and `avg_retrieval_score` at zero aggregation cost.
 
 ```python
-    storage_path = f"{user_id}/{file.filename}"
-    supabase.storage.from_(_STORAGE_BUCKET).upload(
-        storage_path, content, {"content-type": "application/pdf"}
-    )
-    file_url = supabase.storage.from_(_STORAGE_BUCKET).get_public_url(storage_path)
+.order("metadata->>chunk_index")
 ```
-Files are stored under the user's UUID as a folder (`{user_id}/myfile.pdf`). This namespacing is enforced by the Supabase Storage RLS policy (documented in 005_rls.sql). `get_public_url()` returns the CDN URL that the frontend uses to display the file.
-
-```python
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    try:
-        result = await ingest_document(tmp_path, ...)
-    finally:
-        os.unlink(tmp_path)
-```
-PyMuPDF needs a file path (not an in-memory buffer). We write the uploaded bytes to a temporary file, then pass its path to the ingestion pipeline. The `try/finally` block guarantees the temp file is deleted even if ingestion throws an exception — preventing disk leaks.
-
-```python
-@router.get("/")
-def list_documents(x_user_id: str | None = Header(default=None)):
-    result = (
-        supabase.table("document_stats")
-        .select("*")
-        ...
-    )
-```
-Note: this queries the **materialized view** `document_stats`, not the raw `documents` table. This gives the frontend pre-computed `usage_rank`, `rolling_7d_messages`, and `avg_retrieval_score` with zero aggregation cost.
-
-```python
-@router.post("/{document_id}/summarise")
-def summarise_document(...):
-    chunks_result = (
-        supabase.table("chunks")
-        .select("content, metadata")
-        .eq("document_id", document_id)
-        .order("metadata->>chunk_index")
-        .execute()
-    )
-```
-`metadata->>chunk_index` — the `->>` operator extracts a JSONB field as text, which is then sortable numerically. This orders chunks in their original document order (chunk 0, 1, 2...) before passing them to Claude for summarisation. Order matters — a summary generated from randomly ordered chunks would be incoherent.
+`->>` extracts a JSONB field as text. This orders chunks in their original document order (chunk 0, 1, 2...) before passing them to Gemini for summarisation — a summary from randomly ordered chunks would be incoherent.
 
 ---
 
 ## api/routes/chat.py
 
 ```python
-@router.post("/sessions/{session_id}/messages")
-async def send_message(session_id: str, req: MessageRequest, ...):
-```
-This is the most complex route — it orchestrates the entire retrieval + generation pipeline for each user message.
-
-```python
-    history_result = (
-        supabase.rpc("get_session_context", {"p_session_id": session_id, "p_limit": 20})
-        .execute()
-    )
-    history = [{"role": r["role"], "content": r["content"]} for r in (history_result.data or [])]
-```
-Calls the `get_session_context` stored procedure (from 003_procedures.sql) to fetch the last 20 messages in chronological order. The list comprehension strips out timestamps and IDs, leaving only `role` and `content` — the exact format the Claude API expects for the `messages` parameter.
-
-```python
-    pool = multi_query_retrieve(req.query, user_id, doc_id)
-    top = rerank(req.query, pool)
-    context = compress_chunks(req.query, top)
+pool = multi_query_retrieve(req.query, user_id, doc_id)
+top = rerank(req.query, pool)
+context = compress_chunks(req.query, top)
 ```
 The three-stage retrieval pipeline in 3 lines:
-1. `multi_query_retrieve` — generates variants, retrieves for each, deduplicates (returns ~20–80 candidates)
+1. `multi_query_retrieve` — generates variants, retrieves for each, deduplicates (~20–80 candidates)
 2. `rerank` — cross-encoder scores, keeps top 5
 3. `compress_chunks` — strips irrelevant sentences from the top 5
 
 ```python
-    async def event_stream() -> AsyncGenerator[str, None]:
-        tokens: list[str] = []
-
-        for token in stream_answer(req.query, context, history, doc_type):
-            tokens.append(token)
-            yield f"data: {json.dumps({'token': token})}\n\n"
+async def event_stream() -> AsyncGenerator[str, None]:
+    tokens: list[str] = []
+    for token in stream_answer(req.query, context, history, doc_type):
+        tokens.append(token)
+        yield f"data: {json.dumps({'token': token})}\n\n"
 ```
-This is an **async generator** — a function that yields values asynchronously. The `yield` inside makes it a generator; `async def` makes it awaitable.
-
-`f"data: {json.dumps({'token': token})}\n\n"` — this is the **Server-Sent Events (SSE) format**. The protocol requires:
-- Each message prefixed with `data: `
-- Each message terminated with `\n\n` (double newline)
-The frontend's `EventSource` API automatically parses this format and fires an event for each token.
-
-`json.dumps({'token': token})` — even though `token` is a plain string, wrapping it in JSON lets the frontend handle edge cases like tokens containing `\n` or special characters without breaking the SSE format.
+**Server-Sent Events (SSE) format**: each message prefixed with `data: ` and terminated with `\n\n`. The browser's `EventSource` API parses this automatically and fires an event per token. `json.dumps` wraps each token so special characters like `\n` don't break the SSE framing.
 
 ```python
-        full_response = "".join(tokens)
-        latency_ms = int(time.time() * 1000) - start_ms
-        ...
-        supabase.table("chat_history").insert({
-            "session_id": session_id,
-            "role": "assistant",
-            "content": full_response,
-            "source_chunks": cited_ids,
-            "retrieval_score": top_score,
-            "latency_ms": latency_ms,
-        }).execute()
-        yield "data: [DONE]\n\n"
+    full_response = "".join(tokens)
+    supabase.table("chat_history").insert({
+        "role": "assistant",
+        "content": full_response,
+        "source_chunks": cited_ids,
+        "retrieval_score": top_score,
+        "latency_ms": latency_ms,
+    }).execute()
+    yield "data: [DONE]\n\n"
 ```
-The assistant's message is persisted **after** the full response is streamed — we need the complete text to store it. `"".join(tokens)` is efficient in Python (much faster than `+=` string concatenation in a loop).
+The assistant message is persisted after the full response is assembled — we need the complete text to store it. `"".join(tokens)` is efficient Python (much faster than `+=` in a loop). `source_chunks` stores the chunk UUIDs that fed this response; the `chunk_quality_report` view uses these to track which chunks are actually useful over time.
 
-`cited_ids` is the list of chunk UUIDs used in the final context. Storing this in `source_chunks` enables the `chunk_quality_report` view (in 004_views.sql) to track which chunks are actually useful over time — a feedback loop for pipeline evaluation.
-
-`yield "data: [DONE]\n\n"` — the SSE termination signal. The frontend listens for this event to close the connection and stop showing the loading indicator.
+`"data: [DONE]\n\n"` is the SSE termination signal — the frontend closes the connection and stops showing the loading indicator.
 
 ```python
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+return StreamingResponse(event_stream(), media_type="text/event-stream")
 ```
-`StreamingResponse` wraps the async generator and sets the `Content-Type: text/event-stream` header. FastAPI and uvicorn handle the rest — flushing each `yield` to the TCP socket as it arrives, rather than buffering the full response.
+`StreamingResponse` wraps the async generator and sets `Content-Type: text/event-stream`. FastAPI and uvicorn flush each `yield` to the TCP socket as it arrives instead of buffering the full response.
 
 ---
 
-*End of documentation. Every file, every function, every line explained.*
+*End of documentation.*

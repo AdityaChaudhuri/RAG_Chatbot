@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.db.client import supabase
-from app.generation.claude import stream_answer
+from app.generation.gemini import stream_answer
 from app.retrieval.compressor import compress_chunks
 from app.retrieval.multi_query import multi_query_retrieve
 from app.retrieval.reranker import rerank

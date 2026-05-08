@@ -27,54 +27,41 @@ async def ingest_document(
     """
     Parse, enrich, embed, and store a PDF document.
 
-    Args:
-        file_path:  local path to the temporary PDF file
-        user_id:    Supabase auth user UUID
-        filename:   original filename shown in the UI
-        file_url:   Supabase Storage public URL
-
     Returns:
         {document_id, doc_type, entity_tags, chunk_count}
     """
-
-    # ---- 1. Parse PDF -------------------------------------------------------
     pages = parse_pdf(file_path)
     if not pages:
         raise ValueError(f"No extractable text found in {filename}")
 
     text = full_text(pages)
 
-    # ---- 2. NER + classification in parallel (both are CPU-bound / network) -
+    # NER and classification are both CPU-bound — run them concurrently.
     loop = asyncio.get_event_loop()
     entity_tags, doc_type = await asyncio.gather(
         loop.run_in_executor(None, extract_entities, text),
         loop.run_in_executor(None, classify_document, text),
     )
 
-    # ---- 3. Insert document record (chunk_count starts at 0; trigger updates)-
+    # Insert the document row first so chunk foreign keys have a target.
+    # chunk_count starts at 0 and is incremented by trigger on each chunk insert.
     doc_result = (
         supabase.table("documents")
-        .insert(
-            {
-                "user_id": user_id,
-                "filename": filename,
-                "file_url": file_url,
-                "doc_type": doc_type,
-                "entity_tags": entity_tags,
-            }
-        )
+        .insert({
+            "user_id": user_id,
+            "filename": filename,
+            "file_url": file_url,
+            "doc_type": doc_type,
+            "entity_tags": entity_tags,
+        })
         .execute()
     )
     document_id: str = doc_result.data[0]["id"]
 
-    # ---- 4. Semantic chunking -----------------------------------------------
     chunks = semantic_chunk(pages)
-
-    # ---- 5. Embed all chunks (batched inside embedder) ----------------------
     texts = [c["content"] for c in chunks]
     embeddings = await loop.run_in_executor(None, embed_documents, texts)
 
-    # ---- 6. Bulk-insert chunks (batched to stay within Supabase limits) -----
     records = [
         {
             "document_id": document_id,
@@ -90,6 +77,7 @@ async def ingest_document(
         for chunk, embedding in zip(chunks, embeddings)
     ]
 
+    # Batch inserts to stay within Supabase's request body size limit.
     for i in range(0, len(records), _CHUNK_INSERT_BATCH):
         supabase.table("chunks").insert(records[i : i + _CHUNK_INSERT_BATCH]).execute()
 

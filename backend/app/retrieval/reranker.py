@@ -1,13 +1,10 @@
 """
-Cross-encoder re-ranker.
+Cross-encoder re-ranker (ms-marco-MiniLM-L-6-v2).
 
-The hybrid search bi-encoder ranks chunks by independent query and chunk
-embeddings — it never sees them together. A cross-encoder (ms-marco)
-reads the query and chunk concatenated, producing a more accurate
-relevance score at the cost of O(n) forward passes.
-
-We apply it to the top-K pool from multi_query_retrieve and keep only
-the highest-scoring chunks for the final prompt.
+A cross-encoder reads the query and chunk together as a single input and outputs
+one relevance score — more accurate than the bi-encoder used for retrieval,
+at the cost of one forward pass per candidate. We only apply it to the top-K pool
+from multi_query_retrieve, not to all chunks.
 """
 
 from sentence_transformers import CrossEncoder
@@ -31,31 +28,20 @@ def rerank(
     top_k: int | None = None,
 ) -> list[dict]:
     """
-    Re-score and re-rank chunks using a cross-encoder.
+    Re-score and re-rank chunks using the cross-encoder.
 
-    Args:
-        query:  user query string
-        chunks: candidate chunks from multi_query_retrieve (any length)
-        top_k:  number of chunks to keep after re-ranking
-
-    Returns:
-        top_k chunks sorted by cross-encoder score descending, with
-        a "rerank_score" key added to each chunk dict.
+    Returns top_k chunks sorted by cross-encoder score descending,
+    with a "rerank_score" key added to each chunk dict.
     """
     k = top_k or settings.rerank_top_k
 
     if not chunks:
         return []
 
-    model = _get_model()
     pairs = [(query, chunk["content"]) for chunk in chunks]
-    scores: list[float] = model.predict(pairs).tolist()
+    scores: list[float] = _get_model().predict(pairs).tolist()
 
-    scored = sorted(
-        zip(scores, chunks),
-        key=lambda x: x[0],
-        reverse=True,
-    )
+    scored = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
 
     return [
         {**chunk, "rerank_score": score}

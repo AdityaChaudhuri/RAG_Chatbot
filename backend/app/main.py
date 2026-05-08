@@ -5,7 +5,7 @@ from app.api.routes import documents, chat
 
 app = FastAPI(
     title="Mr.Summarizer API",
-    description="Production RAG pipeline — hybrid retrieval, ML re-ranking, Claude generation.",
+    description="Production RAG pipeline — hybrid retrieval, ML re-ranking, Gemini generation.",
     version="1.0.0",
 )
 

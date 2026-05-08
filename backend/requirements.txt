@@ -9,15 +9,11 @@ supabase==2.10.0
 asyncpg==0.30.0
 psycopg2-binary==2.9.10
 
-# Anthropic
-anthropic==0.40.0
-
-# Voyage AI embeddings
-voyageai==0.3.2
+# Gemini (Google AI)
+google-generativeai>=0.8.0
 
 # RAG / LangChain
 langchain==0.3.7
-langchain-anthropic==0.3.0
 langchain-community==0.3.7
 
 # PDF parsing
@@ -27,7 +23,7 @@ pymupdf==1.24.14
 spacy==3.8.2
 # After install run: python -m spacy download en_core_web_trf
 
-# ML — re-ranking and semantic chunking
+# ML — embeddings, re-ranking, semantic chunking
 sentence-transformers==3.3.1
 torch==2.5.1
 transformers==4.46.3

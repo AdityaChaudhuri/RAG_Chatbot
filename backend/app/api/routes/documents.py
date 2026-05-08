@@ -15,7 +15,7 @@ from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.db.client import supabase
-from app.generation.claude import summarise
+from app.generation.gemini import summarise
 from app.ingestion.pipeline import ingest_document
 
 router = APIRouter(prefix="/documents", tags=["documents"])

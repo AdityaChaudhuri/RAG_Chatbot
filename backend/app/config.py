@@ -2,8 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    anthropic_api_key: str
-    voyage_api_key: str
+    gemini_api_key: str
 
     supabase_url: str
     supabase_anon_key: str

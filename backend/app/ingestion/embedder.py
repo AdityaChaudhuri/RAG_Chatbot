@@ -1,47 +1,45 @@
 """
-Voyage AI embedding client.
+Local embedding using BAAI/bge-base-en-v1.5 via sentence-transformers.
 
-voyage-3 produces 1024-dimensional vectors — matching the VECTOR(1024)
-column definition in 001_schema.sql.
-
-Two input types are used:
-  "document" — for chunks at ingestion time (optimised for retrieval)
-  "query"    — for user queries at search time (optimised for matching)
-
-Voyage API has a batch limit of 128 texts per request; embed_documents
-handles batching automatically.
+Runs entirely on the server — no API key, no rate limits, no cost per call.
+Output dimension is 768, matching VECTOR(768) in the database schema.
 """
 
-import voyageai
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
-from app.config import settings
+_MODEL: SentenceTransformer | None = None
+_MODEL_NAME = "BAAI/bge-base-en-v1.5"
+_BATCH_SIZE = 32  # conservative default — safe on CPU with limited RAM
 
-_CLIENT: voyageai.Client | None = None
-_MODEL = "voyage-3"
-_BATCH_SIZE = 128
+# BGE models are trained with this prefix on the query side.
+# Omitting it at query time degrades retrieval accuracy by ~2-3%.
+# Documents are embedded without any prefix.
+_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 
-def _get_client() -> voyageai.Client:
-    global _CLIENT
-    if _CLIENT is None:
-        _CLIENT = voyageai.Client(api_key=settings.voyage_api_key)
-    return _CLIENT
+def _get_model() -> SentenceTransformer:
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = SentenceTransformer(_MODEL_NAME)
+    return _MODEL
 
 
 def embed_documents(texts: list[str]) -> list[list[float]]:
-    """Embed a list of document chunks. Batches automatically."""
-    client = _get_client()
-    all_embeddings: list[list[float]] = []
-
-    for i in range(0, len(texts), _BATCH_SIZE):
-        batch = texts[i : i + _BATCH_SIZE]
-        result = client.embed(batch, model=_MODEL, input_type="document")
-        all_embeddings.extend(result.embeddings)
-
-    return all_embeddings
+    embeddings: np.ndarray = _get_model().encode(
+        texts,
+        batch_size=_BATCH_SIZE,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+    return embeddings.tolist()
 
 
 def embed_query(text: str) -> list[float]:
-    """Embed a single user query."""
-    result = _get_client().embed([text], model=_MODEL, input_type="query")
-    return result.embeddings[0]
+    """Embed a single user query with the BGE query prefix."""
+    embedding: np.ndarray = _get_model().encode(
+        [_QUERY_PREFIX + text],
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+    return embedding[0].tolist()

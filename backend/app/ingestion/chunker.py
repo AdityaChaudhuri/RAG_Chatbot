@@ -1,18 +1,10 @@
 """
-Semantic chunker.
+Semantic chunker — splits documents at topic boundaries rather than fixed character counts.
 
-Splits a document into chunks by detecting topic boundaries — points where
-the cosine similarity between adjacent sentences drops below a threshold.
-This preserves semantic coherence within each chunk, unlike fixed-size
-splitting which can sever a thought mid-sentence.
-
-Algorithm:
-  1. Sentence-tokenise all pages.
-  2. Embed every sentence with a lightweight bi-encoder.
-  3. Compute cosine similarity between each consecutive sentence pair.
-  4. Split where similarity < threshold (topic boundary).
-  5. Merge chunks that are below min_tokens.
-  6. Return chunks with page provenance and token counts.
+A boundary is any point where cosine similarity between two adjacent sentences
+drops below the threshold, indicating a topic shift. Chunks that come out too
+small are merged into their successor; chunks that come out too large are re-split
+at sentence boundaries.
 """
 
 import re
@@ -30,13 +22,12 @@ _EMBED_MODEL: SentenceTransformer | None = None
 def _get_embed_model() -> SentenceTransformer:
     global _EMBED_MODEL
     if _EMBED_MODEL is None:
-        # Small, fast model used only for boundary detection — not for retrieval.
+        # Lightweight model for boundary detection only — not used for retrieval.
         _EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
     return _EMBED_MODEL
 
 
 def _split_sentences(text: str) -> list[str]:
-    # Split on sentence-ending punctuation followed by whitespace.
     parts = re.split(r"(?<=[.!?])\s+", text)
     return [p.strip() for p in parts if p.strip()]
 
@@ -59,9 +50,9 @@ def semantic_chunk(
     """
     Args:
         pages: output of parser.parse_pdf()
-        similarity_threshold: split when adjacent-sentence similarity < this
+        similarity_threshold: split when adjacent-sentence similarity drops below this
         min_tokens: merge chunks smaller than this into the next chunk
-        max_tokens: hard cap — oversized chunks are split at sentence boundaries
+        max_tokens: hard cap — oversized chunks are re-split at sentence boundaries
 
     Returns:
         List of dicts: {content, page_nums, token_count, chunk_index}
@@ -70,7 +61,6 @@ def semantic_chunk(
     min_tok = min_tokens or settings.chunk_min_tokens
     max_tok = max_tokens or settings.chunk_max_tokens
 
-    # ---- 1. Flatten sentences with page provenance -------------------------
     sentences: list[dict] = []
     for page in pages:
         for sent in _split_sentences(page["content"]):
@@ -79,20 +69,17 @@ def semantic_chunk(
     if not sentences:
         return []
 
-    # ---- 2. Embed all sentences in one batched call -----------------------
     texts = [s["text"] for s in sentences]
-    model = _get_embed_model()
-    embeddings: np.ndarray = model.encode(
+    embeddings: np.ndarray = _get_embed_model().encode(
         texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True
     )
 
-    # ---- 3. Adjacent cosine similarities ----------------------------------
     similarities = [
         _cosine(embeddings[i], embeddings[i + 1])
         for i in range(len(embeddings) - 1)
     ]
 
-    # ---- 4. Boundary detection --------------------------------------------
+    # Seed with start and end; add interior split points where similarity drops.
     boundaries = {0}
     for i, sim in enumerate(similarities):
         if sim < threshold:
@@ -100,7 +87,6 @@ def semantic_chunk(
     boundaries.add(len(sentences))
     sorted_boundaries = sorted(boundaries)
 
-    # ---- 5. Build raw chunks ---------------------------------------------
     raw: list[dict] = []
     for i in range(len(sorted_boundaries) - 1):
         start = sorted_boundaries[i]
@@ -108,15 +94,13 @@ def semantic_chunk(
         span = sentences[start:end]
         content = " ".join(s["text"] for s in span)
         page_nums = sorted({s["page_num"] for s in span})
-        raw.append(
-            {
-                "content": content,
-                "page_nums": page_nums,
-                "token_count": _token_count(content),
-            }
-        )
+        raw.append({
+            "content": content,
+            "page_nums": page_nums,
+            "token_count": _token_count(content),
+        })
 
-    # ---- 6. Merge undersized chunks into successor -----------------------
+    # Merge undersized chunks into their successor.
     merged: list[dict] = []
     buffer: dict | None = None
     for chunk in raw:
@@ -132,13 +116,12 @@ def semantic_chunk(
     if buffer:
         merged.append(buffer)
 
-    # ---- 7. Hard-split chunks that exceed max_tokens --------------------
+    # Hard-split any chunk that still exceeds max_tokens at sentence boundaries.
     final: list[dict] = []
     for chunk in merged:
         if chunk["token_count"] <= max_tok:
             final.append(chunk)
         else:
-            # Split at sentence boundaries until under max_tok
             sub_sentences = _split_sentences(chunk["content"])
             sub_buf = []
             for sent in sub_sentences:
@@ -146,25 +129,20 @@ def semantic_chunk(
                 if _token_count(" ".join(sub_buf)) >= max_tok:
                     content = " ".join(sub_buf[:-1])
                     if content.strip():
-                        final.append(
-                            {
-                                "content": content,
-                                "page_nums": chunk["page_nums"],
-                                "token_count": _token_count(content),
-                            }
-                        )
+                        final.append({
+                            "content": content,
+                            "page_nums": chunk["page_nums"],
+                            "token_count": _token_count(content),
+                        })
                     sub_buf = [sent]
             if sub_buf:
                 content = " ".join(sub_buf)
-                final.append(
-                    {
-                        "content": content,
-                        "page_nums": chunk["page_nums"],
-                        "token_count": _token_count(content),
-                    }
-                )
+                final.append({
+                    "content": content,
+                    "page_nums": chunk["page_nums"],
+                    "token_count": _token_count(content),
+                })
 
-    # ---- 8. Attach chunk index ------------------------------------------
     for idx, chunk in enumerate(final):
         chunk["chunk_index"] = idx
 
