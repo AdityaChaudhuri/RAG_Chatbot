@@ -5,32 +5,33 @@ Rephrasing is a simple task that Gemini Flash handles quickly, so we use the
 same model as the main generation layer rather than spinning up a second one.
 """
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from app.config import settings
 from app.retrieval.search import hybrid_search
 
-_MODEL: genai.GenerativeModel | None = None
+_CLIENT: genai.Client | None = None
 
 
-def _get_model() -> genai.GenerativeModel:
-    global _MODEL
-    if _MODEL is None:
-        genai.configure(api_key=settings.gemini_api_key)
-        _MODEL = genai.GenerativeModel("gemini-2.0-flash")
-    return _MODEL
+def _get_client() -> genai.Client:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = genai.Client(api_key=settings.gemini_api_key)
+    return _CLIENT
 
 
 def _generate_variants(query: str, n: int) -> list[str]:
-    response = _get_model().generate_content(
-        (
+    response = _get_client().models.generate_content(
+        model="gemini-2.0-flash",
+        contents=(
             f"Generate {n} semantically varied reformulations of this search query. "
             "Each reformulation should approach the question from a different angle "
             "or use different vocabulary, while preserving the original intent. "
             "Return only the queries, one per line, no numbering or commentary.\n\n"
             f"Query: {query}"
         ),
-        generation_config=genai.GenerationConfig(max_output_tokens=300),
+        config=types.GenerateContentConfig(max_output_tokens=300),
     )
     lines = response.text.strip().splitlines()
     return [line.strip() for line in lines if line.strip()]

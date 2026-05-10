@@ -10,23 +10,23 @@ asyncpg==0.30.0
 psycopg2-binary==2.9.10
 
 # Gemini (Google AI)
-google-generativeai>=0.8.0
+google-genai>=1.0.0
 
 # RAG / LangChain
-langchain==0.3.7
-langchain-community==0.3.7
+langchain>=0.3.20
+langchain-community>=0.3.20
 
 # PDF parsing
 pymupdf==1.24.14
 
 # NLP
-spacy==3.8.2
-# After install run: python -m spacy download en_core_web_trf
+spacy>=3.8.3
+# After install run: python -m spacy download en_core_web_lg
 
 # ML — embeddings, re-ranking, semantic chunking
-sentence-transformers==3.3.1
-torch==2.5.1
-transformers==4.46.3
+sentence-transformers>=3.4.0
+torch>=2.6.0
+transformers>=4.47.0
 
 # Document classification
 scikit-learn==1.5.2

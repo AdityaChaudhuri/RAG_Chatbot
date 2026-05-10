@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     rerank_top_k: int = 5
     multi_query_variants: int = 4
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=("../.env", ".env"), extra="ignore")
 
 
 settings = Settings()  # type: ignore[call-arg]

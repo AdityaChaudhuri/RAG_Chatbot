@@ -69,12 +69,11 @@ async def upload_document(
 @router.get("/")
 def list_documents(x_user_id: str | None = Header(default=None)):
     user_id = _require_user(x_user_id)
-    # Query the materialized view for enriched analytics per document
     result = (
-        supabase.table("document_stats")
-        .select("*")
+        supabase.table("documents")
+        .select("id, filename, doc_type, chunk_count, created_at")
         .eq("user_id", user_id)
-        .order("usage_rank")
+        .order("created_at", desc=True)
         .execute()
     )
     return result.data

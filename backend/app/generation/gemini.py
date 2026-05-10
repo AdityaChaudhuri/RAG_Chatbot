@@ -11,12 +11,13 @@ Setup:
 
 from collections.abc import Generator
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from app.config import settings
 from app.generation.prompts import build_rag_prompt, build_summarise_prompt, system_prompt
 
-_MODEL: genai.GenerativeModel | None = None
+_CLIENT: genai.Client | None = None
 
 CHAT_MODEL = "gemini-2.0-flash"
 _MAX_TOKENS_CHAT = 2048
@@ -24,24 +25,22 @@ _MAX_TOKENS_SUMMARY = 4096
 _HISTORY_WINDOW = 10
 
 
-def _get_model() -> genai.GenerativeModel:
-    global _MODEL
-    if _MODEL is None:
-        genai.configure(api_key=settings.gemini_api_key)
-        _MODEL = genai.GenerativeModel(
-            CHAT_MODEL,
-            system_instruction=system_prompt(),
-        )
-    return _MODEL
+def _get_client() -> genai.Client:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = genai.Client(api_key=settings.gemini_api_key)
+    return _CLIENT
 
 
-def _convert_history(history: list[dict]) -> list[dict]:
-    """Convert OpenAI-style history to Gemini format (assistant → model)."""
+def _convert_history(history: list[dict]) -> list[types.Content]:
+    """Convert OpenAI-style history to Gemini Content objects (assistant → model)."""
     converted = []
     for msg in history:
         role = "model" if msg["role"] == "assistant" else msg["role"]
         if role in ("user", "model"):
-            converted.append({"role": role, "parts": [{"text": msg["content"]}]})
+            converted.append(
+                types.Content(role=role, parts=[types.Part(text=msg["content"])])
+            )
     return converted
 
 
@@ -52,28 +51,34 @@ def stream_answer(
     doc_type: str = "general",
 ) -> Generator[str, None, None]:
     """Stream Gemini's response token-by-token."""
-    model = _get_model()
+    client = _get_client()
     prompt = build_rag_prompt(query, chunks, doc_type)
-    gemini_history = _convert_history(history[-_HISTORY_WINDOW:])
-
-    chat = model.start_chat(history=gemini_history)
-    response = chat.send_message(
-        prompt,
-        stream=True,
-        generation_config=genai.GenerationConfig(max_output_tokens=_MAX_TOKENS_CHAT),
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt(),
+        max_output_tokens=_MAX_TOKENS_CHAT,
     )
 
-    for chunk in response:
+    chat = client.chats.create(
+        model=CHAT_MODEL,
+        history=_convert_history(history[-_HISTORY_WINDOW:]),
+        config=config,
+    )
+
+    for chunk in chat.send_message_stream(prompt):
         if chunk.text:
             yield chunk.text
 
 
 def summarise(chunks: list[dict], doc_type: str = "general") -> str:
     """Generate a full-document summary (blocking)."""
-    model = _get_model()
+    client = _get_client()
     prompt = build_summarise_prompt(chunks, doc_type)
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.GenerationConfig(max_output_tokens=_MAX_TOKENS_SUMMARY),
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt(),
+            max_output_tokens=_MAX_TOKENS_SUMMARY,
+        ),
     )
     return response.text

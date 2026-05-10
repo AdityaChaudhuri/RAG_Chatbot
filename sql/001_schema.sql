@@ -1,5 +1,5 @@
 -- Mr.Summarizer — schema
--- Run once against your Supabase project to set up all tables and indexes.
+-- Run once against Supabase project to set up all tables and indexes.
 
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS vector;       -- pgvector: ANN similarity search
@@ -14,7 +14,7 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_ts_config WHERE cfgname = 'summarizer_fts') THEN
         CREATE TEXT SEARCH CONFIGURATION summarizer_fts (COPY = english);
         ALTER TEXT SEARCH CONFIGURATION summarizer_fts
-            ALTER MAPPING FOR hword, compound_hword, hword_part, word, asciiword
+            ALTER MAPPING FOR hword, hword_part, word, asciiword
             WITH unaccent, english_stem;
     END IF;
 END
