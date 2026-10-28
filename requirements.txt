@@ -1,0 +1,22 @@
+# Database
+psycopg[binary]>=3.2
+pgvector>=0.3
+
+# Models (run locally on CPU)
+sentence-transformers>=3.0   # embeddings + cross-encoder reranker
+spacy>=3.7                   # named entity recognition for the knowledge graph
+
+# Data
+datasets>=2.20
+
+# LLM providers
+anthropic>=0.40
+requests>=2.31               # used to call a local Ollama server
+
+# API
+fastapi>=0.110
+uvicorn>=0.29
+python-dotenv>=1.0
+
+# Tests
+pytest>=8.0
