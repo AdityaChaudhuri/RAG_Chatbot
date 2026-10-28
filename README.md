@@ -68,23 +68,35 @@ The top 6 chunks are numbered and sent to the LLM with instructions to use only 
 
 ## Run it
 
-You need Python 3.10+ and Docker.
+You need Python 3.10 to 3.13 and a Postgres database with pgvector. Pick one option for the database.
+
+**Option A: free cloud database (Neon), easiest on Windows**
+
+1. Sign up at [neon.com](https://neon.com), create a project (choose the region closest to you), and copy the connection string. It looks like `postgresql://user:pass@ep-xxx.region.aws.neon.tech/neondb?sslmode=require`.
+2. You will paste it as `DATABASE_URL` in `.env` in step 2 below, and step 3 creates the tables.
+
+**Option B: local database with Docker**
+
+Run `docker compose up -d`. The schema is created automatically on first start.
+
+**Then:**
 
 ```bash
-# 1. Database (Postgres 16 + pgvector; creates the schema on first start)
-docker compose up -d
-
-# 2. Python environment
+# 1. Python environment
 python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
+.venv\Scripts\activate              # Mac/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 
-# 3. Settings
-cp .env.example .env                 # then add your LLM details (below)
+# 2. Settings
+copy .env.example .env               # Mac/Linux: cp .env.example .env
+# edit .env: DATABASE_URL, plus your LLM details (below)
 
-# 4. Load and index news (first run downloads the models; 3,000 articles takes ~10-20 min on CPU)
-python -m mr_summarizer.ingest --limit 3000
+# 3. Tables (Neon only; Docker does this for you)
+python -m mr_summarizer.init_db
+
+# 4. Load and index news. The first run downloads the models (about 1 GB).
+python -m mr_summarizer.ingest --limit 500     # try small first, then --limit 3000
 
 # 5. Start the app, then open http://localhost:8000
 uvicorn mr_summarizer.api:app --reload
@@ -123,7 +135,8 @@ mr_summarizer/
   text.py        cleaning and sentence-aware chunking
   graph.py       entity normalisation, co-occurrence edges, query entity matching
   models.py      embedding model, cross-encoder, spaCy (lazy-loaded)
-  ingest.py      load -> clean -> chunk -> embed -> NER -> graph
+  init_db.py     creates the tables in a cloud database
+  ingest.py      load -> clean -> chunk -> embed -> NER -> graph (batched writes)
   fusion.py      Reciprocal Rank Fusion
   retrieval.py   keyword, vector and graph retrievers + fusion + rerank
   llm.py         prompt and streaming from Claude or Ollama

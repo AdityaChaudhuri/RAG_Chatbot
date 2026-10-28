@@ -109,3 +109,24 @@ def test_sse_format():
     assert out.startswith("event: token\ndata: ")
     assert out.endswith("\n\n")
     assert json.loads(out.split("data: ", 1)[1]) == "line one\nline two"
+
+
+# ---------- NER output -> graph mentions ----------
+
+class _Ent:
+    def __init__(self, text, label):
+        self.text, self.label_ = text, label
+
+
+class _Doc:
+    def __init__(self, *ents):
+        self.ents = list(ents)
+
+
+def test_extract_mentions_filters_and_dedupes():
+    docs = [
+        _Doc(_Ent("Goldman Sachs", "ORG"), _Ent("Goldman Sachs's", "ORG"),
+             _Ent("Tuesday", "DATE"), _Ent("Reuters", "ORG")),
+        _Doc(),
+    ]
+    assert graph.extract_mentions(docs) == [[("goldman sachs", "Goldman Sachs", "ORG")], []]

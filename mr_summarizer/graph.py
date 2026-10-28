@@ -30,6 +30,20 @@ def keep(key: str, label: str) -> bool:
     return label in KEEP_LABELS and len(key) > 1 and key not in _STOP_ENTITIES
 
 
+def extract_mentions(docs) -> list[list[tuple[str, str, str]]]:
+    """Turn spaCy docs into per-chunk lists of (key, display name, label),
+    keeping only useful entity types and dropping noise."""
+    out = []
+    for doc in docs:
+        seen = {}
+        for ent in doc.ents:
+            key = normalise(ent.text)
+            if keep(key, ent.label_):
+                seen.setdefault((key, ent.label_), ent.text.strip())
+        out.append([(k, name, label) for (k, label), name in seen.items()])
+    return out
+
+
 def cooccurrence_edges(chunk_entities: list[set[int]]) -> Counter:
     """Count shared chunks for every entity pair. Pairs are stored as (low, high)."""
     edges: Counter = Counter()
